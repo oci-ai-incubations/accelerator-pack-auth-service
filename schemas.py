@@ -66,26 +66,3 @@ class CollectionPermissionResponse(BaseModel):
 class MyCollectionAccess(BaseModel):
     collection_id: str
     permission_level: PermissionLevel
-
-
-# ── Conversations ─────────────────────────────────
-class ConversationCreate(BaseModel):
-    external_id: str = Field(max_length=64)
-    title: str = Field(max_length=255, default="New Chat")
-    messages: str = "[]"  # JSON string
-
-
-class ConversationUpdate(BaseModel):
-    title: str | None = Field(default=None, max_length=255)
-    messages: str | None = None  # JSON string
-
-
-class ConversationResponse(BaseModel):
-    id: int
-    external_id: str
-    title: str
-    messages: str
-    created_at: datetime
-    updated_at: datetime
-
-    model_config = {"from_attributes": True}

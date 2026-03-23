@@ -1,4 +1,3 @@
-import json
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
@@ -22,13 +21,10 @@ from auth import (
 )
 from config import settings
 from database import get_db, init_db
-from models import CollectionPermission, Conversation, Role, User
+from models import CollectionPermission, Role, User
 from schemas import (
     CollectionPermissionRequest,
     CollectionPermissionResponse,
-    ConversationCreate,
-    ConversationResponse,
-    ConversationUpdate,
     LoginRequest,
     MyCollectionAccess,
     RefreshRequest,
@@ -339,120 +335,6 @@ async def get_my_collection_access(
         )
         for p in result.scalars().all()
     ]
-
-
-# ── Conversations (authenticated) ────────────────
-
-
-@app.get("/auth/conversations", response_model=list[ConversationResponse])
-async def list_conversations(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Conversation)
-        .where(Conversation.user_id == user.id)
-        .order_by(Conversation.updated_at.desc())
-        .limit(50)
-    )
-    return [ConversationResponse.model_validate(c) for c in result.scalars().all()]
-
-
-@app.post(
-    "/auth/conversations",
-    response_model=ConversationResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_conversation(
-    req: ConversationCreate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    # Validate messages is valid JSON
-    try:
-        json.loads(req.messages)
-    except json.JSONDecodeError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="messages must be valid JSON",
-        ) from e
-
-    conv = Conversation(
-        user_id=user.id,
-        external_id=req.external_id,
-        title=req.title,
-        messages=req.messages,
-    )
-    db.add(conv)
-    await db.commit()
-    await db.refresh(conv)
-    return ConversationResponse.model_validate(conv)
-
-
-@app.get("/auth/conversations/{external_id}", response_model=ConversationResponse)
-async def get_conversation(
-    external_id: str,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Conversation).where(
-            Conversation.external_id == external_id, Conversation.user_id == user.id
-        )
-    )
-    conv = result.scalar_one_or_none()
-    if not conv:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-    return ConversationResponse.model_validate(conv)
-
-
-@app.put("/auth/conversations/{external_id}", response_model=ConversationResponse)
-async def update_conversation(
-    external_id: str,
-    req: ConversationUpdate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Conversation).where(
-            Conversation.external_id == external_id, Conversation.user_id == user.id
-        )
-    )
-    conv = result.scalar_one_or_none()
-    if not conv:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
-    if req.title is not None:
-        conv.title = req.title
-    if req.messages is not None:
-        try:
-            json.loads(req.messages)
-        except json.JSONDecodeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="messages must be valid JSON",
-            ) from e
-        conv.messages = req.messages
-
-    await db.commit()
-    await db.refresh(conv)
-    return ConversationResponse.model_validate(conv)
-
-
-@app.delete("/auth/conversations/{external_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_conversation(
-    external_id: str,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        delete(Conversation).where(
-            Conversation.external_id == external_id, Conversation.user_id == user.id
-        )
-    )
-    if result.rowcount == 0:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-    await db.commit()
 
 
 if __name__ == "__main__":

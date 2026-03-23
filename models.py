@@ -49,9 +49,6 @@ class User(Base):
     refresh_tokens = relationship(
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )
-    conversations = relationship(
-        "Conversation", back_populates="user", cascade="all, delete-orphan"
-    )
 
 
 class CollectionPermission(Base):
@@ -81,27 +78,6 @@ class RefreshToken(Base):
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
 
     user = relationship("User", back_populates="refresh_tokens")
-
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    external_id = Column(String(64), nullable=False, unique=True, index=True)
-    title = Column(String(255), nullable=False, default="New Chat")
-    messages = Column(Text, nullable=False, default="[]")  # JSON array
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-    updated_at = Column(
-        DateTime,
-        nullable=False,
-        default=lambda: datetime.now(UTC),
-        onupdate=lambda: datetime.now(UTC),
-    )
-
-    user = relationship("User", back_populates="conversations")
-
-    __table_args__ = (Index("ix_conversation_user", "user_id"),)
 
 
 class AuditLog(Base):
