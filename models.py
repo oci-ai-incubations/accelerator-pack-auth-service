@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     String,
@@ -35,7 +36,7 @@ class PermissionLevel(enum.StrEnum):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, Identity(always=True), primary_key=True)
     email = Column(String(320), unique=True, nullable=False, index=True)
     name = Column(String(255), nullable=False)
     password_hash = Column(String(255), nullable=False)
@@ -54,7 +55,7 @@ class User(Base):
 class CollectionPermission(Base):
     __tablename__ = "collection_permissions"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, Identity(always=True), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     collection_id = Column(String(255), nullable=False)
     permission_level = Column(Enum(PermissionLevel), nullable=False, default=PermissionLevel.read)
@@ -70,7 +71,7 @@ class CollectionPermission(Base):
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, Identity(always=True), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     token_hash = Column(String(255), nullable=False, unique=True, index=True)
     expires_at = Column(DateTime, nullable=False)
@@ -83,7 +84,7 @@ class RefreshToken(Base):
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, Identity(always=True), primary_key=True)
     user_id = Column(Integer, nullable=False)
     action = Column(String(100), nullable=False)
     target = Column(String(255), nullable=True)
