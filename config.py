@@ -2,8 +2,15 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Database — supports sqlite+aiosqlite://, postgresql+asyncpg://, oracle+oracledb://
+    # Database — supports sqlite+aiosqlite://, postgresql+asyncpg://
+    # For Oracle 26ai, set database_type=oracle and provide oracle_* vars
     database_url: str = "sqlite+aiosqlite:///./auth.db"
+    database_type: str = "auto"  # auto, sqlite, postgres, oracle
+
+    # Oracle 26ai connection (used when database_type=oracle or auto-detected)
+    oracle_connection_string: str = ""  # e.g., tcps://host:1521/service
+    oracle_user: str = ""
+    oracle_password: str = ""
 
     # JWT
     jwt_secret: str = "change-me-in-production"
