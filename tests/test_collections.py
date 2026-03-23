@@ -8,13 +8,13 @@ async def _setup_admin_and_user(client: AsyncClient):
     """Helper: register admin + user, return tokens and user_id."""
     admin = await client.post(
         "/auth/register",
-        json={"email": "admin@test.com", "password": "pass123", "name": "Admin"},
+        json={"email": "admin@test.com", "password": "password123", "name": "Admin"},
     )
     admin_token = admin.json()["access_token"]
 
     user = await client.post(
         "/auth/register",
-        json={"email": "user@test.com", "password": "pass123", "name": "User"},
+        json={"email": "user@test.com", "password": "password123", "name": "User"},
     )
     user_token = user.json()["access_token"]
     user_id = user.json()["user"]["id"]
