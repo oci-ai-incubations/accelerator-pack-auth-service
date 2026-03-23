@@ -1,30 +1,44 @@
+import json
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import (
-    create_token,
+    create_access_token,
+    create_refresh_token_value,
     get_current_user,
     hash_password,
+    log_audit,
     require_admin,
+    revoke_user_tokens,
+    store_refresh_token,
+    validate_refresh_token,
     verify_password,
 )
 from config import settings
 from database import get_db, init_db
-from models import CollectionPermission, Role, User
+from models import CollectionPermission, Conversation, Role, User
 from schemas import (
     CollectionPermissionRequest,
     CollectionPermissionResponse,
+    ConversationCreate,
+    ConversationResponse,
+    ConversationUpdate,
     LoginRequest,
     MyCollectionAccess,
+    RefreshRequest,
     RegisterRequest,
     TokenResponse,
     UpdateUserRequest,
     UserResponse,
 )
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 @asynccontextmanager
@@ -33,15 +47,38 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="aRBi Auth Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="aRBi Auth Service", version="2.0.0", lifespan=lifespan)
+app.state.limiter = limiter
 
+# CORS — configurable via AUTH_CORS_ORIGINS
+origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Security headers middleware
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response: Response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+def _build_token_response(access_token: str, refresh_token: str, user: User) -> TokenResponse:
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=settings.access_token_expire_minutes * 60,
+        user=UserResponse.model_validate(user),
+    )
 
 
 # ── Health ────────────────────────────────────────
@@ -49,19 +86,19 @@ app.add_middleware(
 
 @app.get("/auth/health")
 async def health():
-    return {"status": "healthy", "service": "auth"}
+    return {"status": "healthy", "service": "auth", "version": "2.0.0"}
 
 
 # ── Registration & Login ──────────────────────────
 
 
 @app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit(settings.rate_limit_register)
+async def register(request: Request, req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     existing = await db.execute(select(User).where(User.email == req.email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
 
-    # First user becomes admin automatically
     user_count = await db.scalar(select(func.count()).select_from(User))
     role = Role.admin if user_count == 0 and settings.auto_admin_first_user else Role.pending
 
@@ -75,12 +112,16 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(user)
 
-    token = create_token(user)
-    return TokenResponse(access_token=token, user=UserResponse.model_validate(user))
+    access_token = create_access_token(user)
+    refresh_value = create_refresh_token_value()
+    await store_refresh_token(db, user.id, refresh_value)
+
+    return _build_token_response(access_token, refresh_value, user)
 
 
 @app.post("/auth/login", response_model=TokenResponse)
-async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit(settings.rate_limit_login)
+async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == req.email))
     user = result.scalar_one_or_none()
 
@@ -93,8 +134,44 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
 
-    token = create_token(user)
-    return TokenResponse(access_token=token, user=UserResponse.model_validate(user))
+    access_token = create_access_token(user)
+    refresh_value = create_refresh_token_value()
+    await store_refresh_token(db, user.id, refresh_value)
+
+    return _build_token_response(access_token, refresh_value, user)
+
+
+@app.post("/auth/refresh", response_model=TokenResponse)
+async def refresh_token(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
+    stored = await validate_refresh_token(db, req.refresh_token)
+    if not stored:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token"
+        )
+
+    # Revoke the used refresh token (rotation)
+    stored.revoked = True
+    await db.commit()
+
+    # Load user
+    result = await db.execute(select(User).where(User.id == stored.user_id))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive"
+        )
+
+    # Issue new token pair
+    new_access = create_access_token(user)
+    new_refresh = create_refresh_token_value()
+    await store_refresh_token(db, user.id, new_refresh)
+
+    return _build_token_response(new_access, new_refresh, user)
+
+
+@app.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await revoke_user_tokens(db, user.id)
 
 
 # ── Current User ──────────────────────────────────
@@ -118,7 +195,7 @@ async def list_users(_admin: User = Depends(require_admin), db: AsyncSession = D
 async def update_user(
     user_id: int,
     req: UpdateUserRequest,
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(select(User).where(User.id == user_id))
@@ -126,15 +203,22 @@ async def update_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
+    changes = []
     if req.role is not None:
+        changes.append(f"role: {user.role} -> {req.role}")
         user.role = req.role
     if req.is_active is not None:
+        changes.append(f"active: {user.is_active} -> {req.is_active}")
         user.is_active = req.is_active
     if req.name is not None:
         user.name = req.name
 
     await db.commit()
     await db.refresh(user)
+
+    if changes:
+        await log_audit(db, admin.id, "update_user", f"user={user_id} {', '.join(changes)}")
+
     return UserResponse.model_validate(user)
 
 
@@ -149,16 +233,14 @@ async def update_user(
 async def assign_collection_permission(
     collection_id: str,
     req: CollectionPermissionRequest,
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    # Check user exists
     user_result = await db.execute(select(User).where(User.id == req.user_id))
     user = user_result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    # Upsert: delete existing then insert
     await db.execute(
         delete(CollectionPermission).where(
             CollectionPermission.user_id == req.user_id,
@@ -174,6 +256,13 @@ async def assign_collection_permission(
     db.add(perm)
     await db.commit()
     await db.refresh(perm)
+
+    await log_audit(
+        db,
+        admin.id,
+        "assign_permission",
+        f"user={req.user_id} collection={collection_id} level={req.permission_level}",
+    )
 
     return CollectionPermissionResponse(
         id=perm.id,
@@ -191,7 +280,7 @@ async def assign_collection_permission(
 async def revoke_collection_permission(
     collection_id: str,
     user_id: int,
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
@@ -203,6 +292,7 @@ async def revoke_collection_permission(
     if result.rowcount == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Permission not found")
     await db.commit()
+    await log_audit(db, admin.id, "revoke_permission", f"user={user_id} collection={collection_id}")
 
 
 @app.get(
@@ -236,7 +326,6 @@ async def get_my_collection_access(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Admins see all collections — return empty list (frontend interprets as "all access")
     if user.role == Role.admin:
         return []
 
@@ -250,6 +339,120 @@ async def get_my_collection_access(
         )
         for p in result.scalars().all()
     ]
+
+
+# ── Conversations (authenticated) ────────────────
+
+
+@app.get("/auth/conversations", response_model=list[ConversationResponse])
+async def list_conversations(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Conversation)
+        .where(Conversation.user_id == user.id)
+        .order_by(Conversation.updated_at.desc())
+        .limit(50)
+    )
+    return [ConversationResponse.model_validate(c) for c in result.scalars().all()]
+
+
+@app.post(
+    "/auth/conversations",
+    response_model=ConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_conversation(
+    req: ConversationCreate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Validate messages is valid JSON
+    try:
+        json.loads(req.messages)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="messages must be valid JSON",
+        ) from e
+
+    conv = Conversation(
+        user_id=user.id,
+        external_id=req.external_id,
+        title=req.title,
+        messages=req.messages,
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    return ConversationResponse.model_validate(conv)
+
+
+@app.get("/auth/conversations/{external_id}", response_model=ConversationResponse)
+async def get_conversation(
+    external_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.external_id == external_id, Conversation.user_id == user.id
+        )
+    )
+    conv = result.scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    return ConversationResponse.model_validate(conv)
+
+
+@app.put("/auth/conversations/{external_id}", response_model=ConversationResponse)
+async def update_conversation(
+    external_id: str,
+    req: ConversationUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.external_id == external_id, Conversation.user_id == user.id
+        )
+    )
+    conv = result.scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    if req.title is not None:
+        conv.title = req.title
+    if req.messages is not None:
+        try:
+            json.loads(req.messages)
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="messages must be valid JSON",
+            ) from e
+        conv.messages = req.messages
+
+    await db.commit()
+    await db.refresh(conv)
+    return ConversationResponse.model_validate(conv)
+
+
+@app.delete("/auth/conversations/{external_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    external_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        delete(Conversation).where(
+            Conversation.external_id == external_id, Conversation.user_id == user.id
+        )
+    )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    await db.commit()
 
 
 if __name__ == "__main__":
