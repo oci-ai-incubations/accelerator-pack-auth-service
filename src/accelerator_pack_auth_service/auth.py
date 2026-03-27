@@ -63,7 +63,7 @@ async def validate_refresh_token(db: AsyncSession, token_value: str) -> RefreshT
     result = await db.execute(
         select(RefreshToken).where(
             RefreshToken.token_hash == token_hash,
-            RefreshToken.revoked.is_(False),
+            RefreshToken.revoked == 0,
             RefreshToken.expires_at > datetime.now(UTC),
         )
     )
@@ -72,7 +72,7 @@ async def validate_refresh_token(db: AsyncSession, token_value: str) -> RefreshT
 
 async def revoke_user_tokens(db: AsyncSession, user_id: int) -> None:
     result = await db.execute(
-        select(RefreshToken).where(RefreshToken.user_id == user_id, RefreshToken.revoked.is_(False))
+        select(RefreshToken).where(RefreshToken.user_id == user_id, RefreshToken.revoked == 0)
     )
     for token in result.scalars().all():
         token.revoked = True
@@ -183,7 +183,7 @@ async def clear_failed_attempts(db: AsyncSession, email: str) -> None:
 async def enforce_session_limit(db: AsyncSession, user_id: int) -> None:
     result = await db.execute(
         select(RefreshToken)
-        .where(RefreshToken.user_id == user_id, RefreshToken.revoked.is_(False))
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked == 0)
         .order_by(RefreshToken.created_at.desc())
     )
     active_tokens = result.scalars().all()
