@@ -143,6 +143,72 @@ async def apply_claim_mappings(
     return assigned_roles
 
 
+async def exchange_oidc_code(
+    provider: IdentityProvider,
+    code: str,
+    redirect_uri: str,
+) -> dict:
+    """Exchange an OIDC authorization code for user info at the IdP.
+
+    Returns a dict of claims (sub, email, name, etc.) from the ID token or userinfo.
+    """
+    import httpx
+
+    config = provider.config or {}
+    issuer = config.get("issuer", "")
+    client_id = config.get("client_id", "")
+    client_secret = config.get("client_secret", "")
+    token_url = config.get("token_url", f"{issuer}/token")
+    userinfo_url = config.get("userinfo_url", f"{issuer}/userinfo")
+
+    # Exchange code for tokens
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            headers={"Accept": "application/json"},
+        )
+
+        if token_resp.status_code != 200:
+            from fastapi import HTTPException, status
+
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"IdP token exchange failed: {token_resp.text}",
+            )
+
+        tokens = token_resp.json()
+        access_token = tokens.get("access_token", "")
+
+        # Fetch user info
+        userinfo_resp = await client.get(
+            userinfo_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+
+        if userinfo_resp.status_code == 200:
+            return userinfo_resp.json()
+
+        # Fallback: decode ID token claims if userinfo fails
+        id_token = tokens.get("id_token", "")
+        if id_token:
+            import json
+            from base64 import urlsafe_b64decode
+
+            payload = id_token.split(".")[1]
+            # Add padding
+            payload += "=" * (4 - len(payload) % 4)
+            return json.loads(urlsafe_b64decode(payload))
+
+        return {"sub": "unknown", "email": "", "name": "SSO User"}
+
+
 async def issue_sso_tokens(
     db: AsyncSession,
     user: User,

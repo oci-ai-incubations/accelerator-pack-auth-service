@@ -362,3 +362,135 @@ async def test_sso_callback_unknown_provider_fails(client: AsyncClient):
         },
     )
     assert resp.status_code == 404
+
+
+# ── Public Provider Discovery ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_public_providers_no_auth_required(client: AsyncClient):
+    """GET /auth/providers/public should work without authentication."""
+    resp = await client.get("/auth/sso/providers")
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)
+
+
+@pytest.mark.asyncio
+async def test_public_providers_returns_only_active(client: AsyncClient):
+    """Only active providers should appear in public list."""
+    token = await _get_admin_token(client)
+
+    # Create active provider
+    await client.post(
+        "/auth/providers",
+        json={"type": "oidc", "name": "Active", "slug": "active-pub", "config": {}},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    # Create inactive provider
+    await client.post(
+        "/auth/providers",
+        json={
+            "type": "oidc",
+            "name": "Inactive",
+            "slug": "inactive-pub",
+            "config": {},
+            "is_active": False,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    resp = await client.get("/auth/sso/providers")
+    assert resp.status_code == 200
+    slugs = {p["slug"] for p in resp.json()}
+    assert "active-pub" in slugs
+    assert "inactive-pub" not in slugs
+
+
+@pytest.mark.asyncio
+async def test_public_providers_minimal_fields(client: AsyncClient):
+    """Public providers should not expose config/secrets."""
+    token = await _get_admin_token(client)
+    await client.post(
+        "/auth/providers",
+        json={
+            "type": "oidc",
+            "name": "Minimal",
+            "slug": "minimal-pub",
+            "config": {"client_id": "secret-id", "client_secret": "super-secret"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    resp = await client.get("/auth/sso/providers")
+    providers = resp.json()
+    for p in providers:
+        assert "config" not in p
+        assert "client_secret" not in p
+        assert set(p.keys()) <= {"id", "type", "name", "slug"}
+
+
+# ── SSO Authorize URL ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sso_authorize_oidc(client: AsyncClient):
+    """GET /auth/sso/{slug}/authorize should return an authorization URL for OIDC."""
+    token = await _get_admin_token(client)
+    await client.post(
+        "/auth/providers",
+        json={
+            "type": "oidc",
+            "name": "OIDC Auth",
+            "slug": "oidc-auth",
+            "config": {
+                "issuer": "https://idp.example.com",
+                "client_id": "test-client-id",
+                "client_secret": "test-secret",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    resp = await client.get(
+        "/auth/sso/oidc-auth/authorize",
+        params={"redirect_uri": "http://localhost:3000/auth/callback"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "authorize_url" in data
+    assert "state" in data
+    assert "test-client-id" in data["authorize_url"]
+    assert "redirect_uri=" in data["authorize_url"]
+
+
+@pytest.mark.asyncio
+async def test_sso_authorize_unknown_slug(client: AsyncClient):
+    resp = await client.get(
+        "/auth/sso/nonexistent/authorize",
+        params={"redirect_uri": "http://localhost:3000/auth/callback"},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sso_authorize_saml(client: AsyncClient):
+    """SAML authorize should return the login URL."""
+    token = await _get_admin_token(client)
+    await client.post(
+        "/auth/providers",
+        json={
+            "type": "saml",
+            "name": "SAML Auth",
+            "slug": "saml-auth",
+            "config": {"login_url": "https://saml.example.com/sso"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    resp = await client.get(
+        "/auth/sso/saml-auth/authorize",
+        params={"redirect_uri": "http://localhost:3000/auth/callback"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["authorize_url"] == "https://saml.example.com/sso"

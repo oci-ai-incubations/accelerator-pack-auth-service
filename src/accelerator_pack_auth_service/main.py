@@ -920,6 +920,124 @@ async def sso_callback(
     return _build_token_response(access_token, refresh_value, user)
 
 
+# ── SSO Public Discovery & OIDC Flow ─────────────
+
+
+@app.get("/auth/sso/providers")
+async def list_public_providers(db: AsyncSession = Depends(get_db)):
+    """Public endpoint: returns active SSO providers for the login page."""
+    result = await db.execute(
+        select(IdentityProvider)
+        .where(IdentityProvider.is_active.is_(True))
+        .order_by(IdentityProvider.priority.desc())
+    )
+    return [
+        {"id": p.id, "type": p.type.value, "name": p.name, "slug": p.slug}
+        for p in result.scalars().all()
+    ]
+
+
+@app.get("/auth/sso/{slug}/authorize")
+async def sso_authorize(
+    slug: str,
+    redirect_uri: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Build the IdP authorization URL for OIDC/SAML redirect."""
+    import secrets
+
+    result = await db.execute(
+        select(IdentityProvider).where(
+            IdentityProvider.slug == slug, IdentityProvider.is_active.is_(True)
+        )
+    )
+    provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
+
+    config = provider.config or {}
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(16)
+
+    if provider.type.value == "oidc":
+        issuer = config.get("issuer", "")
+        client_id = config.get("client_id", "")
+        scope = config.get("scope", "openid email profile")
+        authorize_endpoint = config.get("authorize_url", f"{issuer}/authorize")
+
+        params = (
+            f"?client_id={client_id}"
+            f"&redirect_uri={redirect_uri}"
+            f"&response_type=code"
+            f"&scope={scope}"
+            f"&state={state}"
+            f"&nonce={nonce}"
+        )
+        return {
+            "authorize_url": f"{authorize_endpoint}{params}",
+            "state": state,
+            "provider_slug": slug,
+        }
+
+    elif provider.type.value == "saml":
+        login_url = config.get("login_url", "")
+        return {
+            "authorize_url": login_url,
+            "state": state,
+            "provider_slug": slug,
+        }
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unsupported provider type: {provider.type.value}",
+    )
+
+
+@app.post("/auth/sso/{slug}/token", response_model=TokenResponse)
+async def sso_token_exchange(
+    slug: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Exchange OIDC authorization code for internal JWT tokens."""
+    body = await request.json()
+    code = body.get("code", "")
+    redirect_uri = body.get("redirect_uri", "")
+
+    result = await db.execute(
+        select(IdentityProvider).where(
+            IdentityProvider.slug == slug, IdentityProvider.is_active.is_(True)
+        )
+    )
+    provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
+
+    from .sso_service import (
+        apply_claim_mappings,
+        exchange_oidc_code,
+        issue_sso_tokens,
+        jit_provision_user,
+    )
+
+    # Exchange code with IdP
+    user_info = await exchange_oidc_code(provider, code, redirect_uri)
+
+    # JIT provision
+    user, _created = await jit_provision_user(
+        db,
+        provider,
+        external_id=user_info.get("sub", user_info.get("email", "")),
+        email=user_info.get("email", ""),
+        name=user_info.get("name", "SSO User"),
+        raw_claims=user_info,
+    )
+
+    await apply_claim_mappings(db, provider, user, user_info)
+    access_token, refresh_value = await issue_sso_tokens(db, user)
+    return _build_token_response(access_token, refresh_value, user)
+
+
 # ── Groups (Phase 4, admin) ───────────────────────
 
 

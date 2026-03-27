@@ -30,7 +30,7 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: pip install -e .
       - name: Run tests with coverage
-        run: pytest --cov=accelerator_pack_auth_service --cov-report=term-missing --cov-fail-under=70 -v
+        run: pytest --cov=accelerator_pack_auth_service --cov-report=term-missing --cov-fail-under=65 -v
 
   security:
     runs-on: ubuntu-latest

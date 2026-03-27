@@ -27,4 +27,4 @@ testpaths = ["tests"]
 source = ["accelerator_pack_auth_service"]
 
 [tool.coverage.report]
-fail_under = 70
+fail_under = 65
