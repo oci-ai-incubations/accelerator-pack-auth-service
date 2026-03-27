@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     audit_enabled: bool = True
     audit_retention_days: int = 90
 
+    # SSO
+    sso_redirect_base_url: str = ""  # e.g., https://app.example.com
+
     # Profile: minimal|standard|enterprise|custom
     profile: str = "custom"
 
