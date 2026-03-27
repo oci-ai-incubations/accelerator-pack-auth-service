@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,11 +9,17 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import (
+    blacklist_token,
+    check_account_lockout,
+    clear_failed_attempts,
     create_access_token,
     create_refresh_token_value,
+    decode_token,
+    enforce_session_limit,
     get_current_user,
     hash_password,
     log_audit,
+    record_failed_login,
     require_admin,
     revoke_user_tokens,
     store_refresh_token,
@@ -29,6 +36,7 @@ from schemas import (
     MyCollectionAccess,
     RefreshRequest,
     RegisterRequest,
+    RevokeRequest,
     TokenResponse,
     UpdateUserRequest,
     UserResponse,
@@ -82,7 +90,12 @@ def _build_token_response(access_token: str, refresh_token: str, user: User) -> 
 
 @app.get("/auth/health")
 async def health():
-    return {"status": "healthy", "service": "auth", "version": "2.0.0"}
+    return {"status": "healthy", "service": "auth", "version": "3.0.0"}
+
+
+@app.get("/auth/alive")
+async def alive():
+    return {"status": "alive"}
 
 
 # ── Registration & Login ──────────────────────────
@@ -108,6 +121,7 @@ async def register(request: Request, req: RegisterRequest, db: AsyncSession = De
     await db.commit()
     await db.refresh(user)
 
+    await enforce_session_limit(db, user.id)
     access_token = create_access_token(user)
     refresh_value = create_refresh_token_value()
     await store_refresh_token(db, user.id, refresh_value)
@@ -118,10 +132,14 @@ async def register(request: Request, req: RegisterRequest, db: AsyncSession = De
 @app.post("/auth/login", response_model=TokenResponse)
 @limiter.limit(settings.rate_limit_login)
 async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(get_db)):
+    await check_account_lockout(db, req.email)
+
     result = await db.execute(select(User).where(User.email == req.email))
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(req.password, user.password_hash):
+        ip = request.client.host if request.client else None
+        await record_failed_login(db, req.email, ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -129,6 +147,9 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
 
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+
+    await clear_failed_attempts(db, req.email)
+    await enforce_session_limit(db, user.id)
 
     access_token = create_access_token(user)
     refresh_value = create_refresh_token_value()
@@ -166,8 +187,35 @@ async def refresh_token(req: RefreshRequest, db: AsyncSession = Depends(get_db))
 
 
 @app.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def logout(
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Blacklist the current access token
+    token = request.headers.get("authorization", "").removeprefix("Bearer ")
+    if token:
+        payload = decode_token(token)
+        jti = payload.get("jti")
+        if jti:
+            exp = datetime.fromtimestamp(payload["exp"], tz=UTC)
+            await blacklist_token(db, jti, exp)
+    # Revoke all refresh tokens
     await revoke_user_tokens(db, user.id)
+
+
+@app.post("/auth/token/revoke", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_token(
+    req: RevokeRequest,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    payload = decode_token(req.token)
+    jti = payload.get("jti")
+    if not jti:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token has no JTI")
+    exp = datetime.fromtimestamp(payload["exp"], tz=UTC)
+    await blacklist_token(db, jti, exp)
 
 
 # ── Current User ──────────────────────────────────

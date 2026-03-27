@@ -81,6 +81,24 @@ class RefreshToken(Base):
     user = relationship("User", back_populates="refresh_tokens")
 
 
+class TokenBlacklist(Base):
+    __tablename__ = "token_blacklist"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    jti = Column(String(36), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+
+
+class FailedLoginAttempt(Base):
+    __tablename__ = "failed_login_attempts"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    email = Column(String(320), nullable=False, index=True)
+    ip_address = Column(String(45), nullable=True)
+    attempted_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

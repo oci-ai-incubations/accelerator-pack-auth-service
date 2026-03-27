@@ -29,6 +29,10 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class RevokeRequest(BaseModel):
+    token: str
+
+
 # ── Users ─────────────────────────────────────────
 class UserResponse(BaseModel):
     id: int

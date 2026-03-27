@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     cors_origins: str = "*"  # comma-separated; set to specific origins in prod
     rate_limit_login: str = "10/minute"
     rate_limit_register: str = "5/minute"
+    account_lockout_threshold: int = 5
+    account_lockout_duration_minutes: int = 30
+    max_concurrent_sessions: int = 5
 
     # First registered user auto-promoted to admin
     auto_admin_first_user: bool = True
