@@ -213,6 +213,70 @@ class ResourceOwnership(Base):
     )
 
 
+# ── Phase 3: OIDC & SAML ─────────────────────────
+
+
+class ProviderType(enum.StrEnum):
+    oidc = "oidc"
+    saml = "saml"
+
+
+class IdentityProvider(Base):
+    __tablename__ = "identity_providers"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
+    type = Column(Enum(ProviderType), nullable=False)
+    name = Column(String(255), nullable=False)
+    slug = Column(String(100), unique=True, nullable=False, index=True)
+    config = Column(JSON, nullable=False, default=dict)
+    is_active = Column(Boolean, nullable=False, default=True)
+    priority = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+
+    claim_mappings = relationship(
+        "ClaimRoleMapping", back_populates="provider", cascade="all, delete-orphan"
+    )
+
+
+class ExternalIdentity(Base):
+    __tablename__ = "external_identities"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    provider_id = Column(
+        Integer, ForeignKey("identity_providers.id", ondelete="CASCADE"), nullable=False
+    )
+    external_id = Column(String(255), nullable=False)
+    email = Column(String(320), nullable=True)
+    raw_claims = Column(JSON, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
+
+    user = relationship("User")
+    provider = relationship("IdentityProvider")
+
+    __table_args__ = (
+        UniqueConstraint("provider_id", "external_id", name="uq_provider_external_id"),
+    )
+
+
+class ClaimRoleMapping(Base):
+    __tablename__ = "claim_role_mappings"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    provider_id = Column(
+        Integer, ForeignKey("identity_providers.id", ondelete="CASCADE"), nullable=False
+    )
+    claim_key = Column(String(255), nullable=False)
+    claim_value_pattern = Column(String(255), nullable=False)
+    role_id = Column(Integer, ForeignKey("roles.id", ondelete="CASCADE"), nullable=False)
+    priority = Column(Integer, nullable=False, default=0)
+    is_regex = Column(Boolean, nullable=False, default=False)
+
+    provider = relationship("IdentityProvider", back_populates="claim_mappings")
+    role = relationship("DbRole")
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

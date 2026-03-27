@@ -29,8 +29,20 @@ from auth import (
 )
 from config import settings
 from database import get_db, init_db
-from models import CollectionPermission, DbRole, Permission, Role, RolePermission, User, UserRole
+from models import (
+    ClaimRoleMapping,
+    CollectionPermission,
+    DbRole,
+    IdentityProvider,
+    Permission,
+    Role,
+    RolePermission,
+    User,
+    UserRole,
+)
 from schemas import (
+    ClaimMappingCreate,
+    ClaimMappingResponse,
     CollectionPermissionRequest,
     CollectionPermissionResponse,
     LoginRequest,
@@ -38,6 +50,9 @@ from schemas import (
     PermissionCheck,
     PermissionCheckResult,
     PermissionResponse,
+    ProviderCreate,
+    ProviderResponse,
+    ProviderUpdate,
     RefreshRequest,
     RegisterRequest,
     RevokeRequest,
@@ -92,6 +107,14 @@ async def security_headers(request: Request, call_next):
     return response
 
 
+def _require_local_auth():
+    if not settings.local_auth_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Local authentication is disabled. Use SSO.",
+        )
+
+
 def _build_token_response(access_token: str, refresh_token: str, user: User) -> TokenResponse:
     return TokenResponse(
         access_token=access_token,
@@ -120,6 +143,7 @@ async def alive():
 @app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit(settings.rate_limit_register)
 async def register(request: Request, req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    _require_local_auth()
     existing = await db.execute(select(User).where(User.email == req.email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
@@ -148,6 +172,7 @@ async def register(request: Request, req: RegisterRequest, db: AsyncSession = De
 @app.post("/auth/login", response_model=TokenResponse)
 @limiter.limit(settings.rate_limit_login)
 async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(get_db)):
+    _require_local_auth()
     await check_account_lockout(db, req.email)
 
     result = await db.execute(select(User).where(User.email == req.email))
@@ -671,6 +696,227 @@ async def remove_user_role(
     await db.delete(assignment)
     await db.commit()
     await log_audit(db, admin.id, "remove_role", f"user={user_id} assignment={assignment_id}")
+
+
+# ── Identity Providers (Phase 3) ──────────────────
+
+
+@app.get("/auth/providers", response_model=list[ProviderResponse])
+async def list_providers(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(IdentityProvider).order_by(IdentityProvider.priority.desc()))
+    return [ProviderResponse.model_validate(p) for p in result.scalars().all()]
+
+
+@app.post("/auth/providers", response_model=ProviderResponse, status_code=status.HTTP_201_CREATED)
+async def create_provider(
+    req: ProviderCreate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    existing = await db.execute(select(IdentityProvider).where(IdentityProvider.slug == req.slug))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug already exists")
+
+    provider = IdentityProvider(
+        type=req.type,
+        name=req.name,
+        slug=req.slug,
+        config=req.config,
+        tenant_id=req.tenant_id,
+        is_active=req.is_active,
+        priority=req.priority,
+        created_at=datetime.now(UTC),
+    )
+    db.add(provider)
+    await db.commit()
+    await db.refresh(provider)
+    await log_audit(db, admin.id, "create_provider", f"provider={provider.slug}")
+    return ProviderResponse.model_validate(provider)
+
+
+@app.get("/auth/providers/{provider_id}", response_model=ProviderResponse)
+async def get_provider(
+    provider_id: int,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
+    provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
+    return ProviderResponse.model_validate(provider)
+
+
+@app.patch("/auth/providers/{provider_id}", response_model=ProviderResponse)
+async def update_provider(
+    provider_id: int,
+    req: ProviderUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
+    provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
+
+    if req.name is not None:
+        provider.name = req.name
+    if req.config is not None:
+        provider.config = req.config
+    if req.is_active is not None:
+        provider.is_active = req.is_active
+    if req.priority is not None:
+        provider.priority = req.priority
+
+    await db.commit()
+    await db.refresh(provider)
+    await log_audit(db, admin.id, "update_provider", f"provider={provider_id}")
+    return ProviderResponse.model_validate(provider)
+
+
+@app.delete("/auth/providers/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_provider(
+    provider_id: int,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
+    provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
+    await db.delete(provider)
+    await db.commit()
+    await log_audit(db, admin.id, "delete_provider", f"provider={provider.slug}")
+
+
+# ── Claim Mappings (Phase 3) ─────────────────────
+
+
+@app.get("/auth/providers/{provider_id}/mappings", response_model=list[ClaimMappingResponse])
+async def list_claim_mappings(
+    provider_id: int,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(ClaimRoleMapping)
+        .where(ClaimRoleMapping.provider_id == provider_id)
+        .order_by(ClaimRoleMapping.priority.desc())
+    )
+    return [ClaimMappingResponse.model_validate(m) for m in result.scalars().all()]
+
+
+@app.post(
+    "/auth/providers/{provider_id}/mappings",
+    response_model=ClaimMappingResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_claim_mapping(
+    provider_id: int,
+    req: ClaimMappingCreate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    # Verify provider exists
+    prov_result = await db.execute(
+        select(IdentityProvider).where(IdentityProvider.id == provider_id)
+    )
+    if not prov_result.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
+
+    # Verify role exists
+    role_result = await db.execute(select(DbRole).where(DbRole.id == req.role_id))
+    if not role_result.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+
+    mapping = ClaimRoleMapping(
+        provider_id=provider_id,
+        claim_key=req.claim_key,
+        claim_value_pattern=req.claim_value_pattern,
+        role_id=req.role_id,
+        priority=req.priority,
+        is_regex=req.is_regex,
+    )
+    db.add(mapping)
+    await db.commit()
+    await db.refresh(mapping)
+    await log_audit(db, admin.id, "create_claim_mapping", f"provider={provider_id}")
+    return ClaimMappingResponse.model_validate(mapping)
+
+
+@app.delete(
+    "/auth/providers/{provider_id}/mappings/{mapping_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_claim_mapping(
+    provider_id: int,
+    mapping_id: int,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(ClaimRoleMapping).where(
+            ClaimRoleMapping.id == mapping_id,
+            ClaimRoleMapping.provider_id == provider_id,
+        )
+    )
+    mapping = result.scalar_one_or_none()
+    if not mapping:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mapping not found")
+    await db.delete(mapping)
+    await db.commit()
+    await log_audit(db, admin.id, "delete_claim_mapping", f"mapping={mapping_id}")
+
+
+# ── SSO Callback (Phase 3) ───────────────────────
+
+
+@app.post("/auth/sso/callback", response_model=TokenResponse)
+async def sso_callback(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Generic SSO callback — called by OIDC/SAML handlers after external auth.
+
+    Expects JSON body with: provider_slug, external_id, email, name, claims.
+    In production, the OIDC callback and SAML ACS endpoints validate the
+    external token/assertion and then call this internally.
+    """
+    body = await request.json()
+    slug = body.get("provider_slug")
+    if not slug:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="provider_slug required"
+        )
+
+    result = await db.execute(
+        select(IdentityProvider).where(
+            IdentityProvider.slug == slug, IdentityProvider.is_active.is_(True)
+        )
+    )
+    provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
+
+    from sso_service import apply_claim_mappings, issue_sso_tokens, jit_provision_user
+
+    user, _created = await jit_provision_user(
+        db,
+        provider,
+        external_id=body.get("external_id", ""),
+        email=body.get("email", ""),
+        name=body.get("name", "SSO User"),
+        raw_claims=body.get("claims"),
+    )
+
+    claims = body.get("claims", {})
+    await apply_claim_mappings(db, provider, user, claims)
+
+    access_token, refresh_value = await issue_sso_tokens(db, user)
+    return _build_token_response(access_token, refresh_value, user)
 
 
 if __name__ == "__main__":
