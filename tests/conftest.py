@@ -32,6 +32,12 @@ async def db_engine():
     engine = create_async_engine(TEST_DB_URL, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # Seed system roles and permissions for RBAC tests
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        from permission_service import seed_roles_and_permissions
+
+        await seed_roles_and_permissions(session)
     yield engine
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)

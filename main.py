@@ -21,6 +21,7 @@ from auth import (
     log_audit,
     record_failed_login,
     require_admin,
+    require_permission,
     revoke_user_tokens,
     store_refresh_token,
     validate_refresh_token,
@@ -28,18 +29,27 @@ from auth import (
 )
 from config import settings
 from database import get_db, init_db
-from models import CollectionPermission, Role, User
+from models import CollectionPermission, DbRole, Permission, Role, RolePermission, User, UserRole
 from schemas import (
     CollectionPermissionRequest,
     CollectionPermissionResponse,
     LoginRequest,
     MyCollectionAccess,
+    PermissionCheck,
+    PermissionCheckResult,
+    PermissionResponse,
     RefreshRequest,
     RegisterRequest,
     RevokeRequest,
+    RoleCreate,
+    RolePermissionUpdate,
+    RoleResponse,
+    RoleUpdate,
     TokenResponse,
     UpdateUserRequest,
     UserResponse,
+    UserRoleAssign,
+    UserRoleResponse,
 )
 
 limiter = Limiter(key_func=get_remote_address)
@@ -48,6 +58,12 @@ limiter = Limiter(key_func=get_remote_address)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await init_db()
+    # Seed system roles and permissions
+    from database import async_session
+    from permission_service import seed_roles_and_permissions
+
+    async with async_session() as db:
+        await seed_roles_and_permissions(db)
     yield
 
 
@@ -383,6 +399,278 @@ async def get_my_collection_access(
         )
         for p in result.scalars().all()
     ]
+
+
+# ── Roles (Phase 2, admin only) ───────────────────
+
+
+async def _build_role_response(db: AsyncSession, role: DbRole) -> RoleResponse:
+    result = await db.execute(
+        select(Permission.codename)
+        .join(RolePermission, RolePermission.permission_id == Permission.id)
+        .where(RolePermission.role_id == role.id)
+    )
+    perms = [row[0] for row in result.all()]
+    return RoleResponse(
+        id=role.id,
+        name=role.name,
+        description=role.description,
+        is_system=role.is_system,
+        is_default=role.is_default,
+        tenant_id=role.tenant_id,
+        permissions=perms,
+        created_at=role.created_at,
+    )
+
+
+@app.get("/auth/roles", response_model=list[RoleResponse])
+async def list_roles(
+    _user: User = Depends(require_permission("roles:list")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DbRole).order_by(DbRole.name))
+    roles = result.scalars().all()
+    return [await _build_role_response(db, r) for r in roles]
+
+
+@app.post("/auth/roles", response_model=RoleResponse, status_code=status.HTTP_201_CREATED)
+async def create_role(
+    req: RoleCreate,
+    admin: User = Depends(require_permission("roles:create")),
+    db: AsyncSession = Depends(get_db),
+):
+    existing = await db.execute(
+        select(DbRole).where(DbRole.name == req.name, DbRole.tenant_id == req.tenant_id)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Role name already exists")
+
+    role = DbRole(
+        name=req.name,
+        description=req.description,
+        tenant_id=req.tenant_id,
+        created_at=datetime.now(UTC),
+    )
+    db.add(role)
+    await db.commit()
+    await db.refresh(role)
+    await log_audit(db, admin.id, "create_role", f"role={role.name}")
+    return await _build_role_response(db, role)
+
+
+@app.get("/auth/roles/{role_id}", response_model=RoleResponse)
+async def get_role(
+    role_id: int,
+    _user: User = Depends(require_permission("roles:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DbRole).where(DbRole.id == role_id))
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+    return await _build_role_response(db, role)
+
+
+@app.patch("/auth/roles/{role_id}", response_model=RoleResponse)
+async def update_role(
+    role_id: int,
+    req: RoleUpdate,
+    admin: User = Depends(require_permission("roles:update")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DbRole).where(DbRole.id == role_id))
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+    if role.is_system:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify system roles"
+        )
+
+    if req.name is not None:
+        role.name = req.name
+    if req.description is not None:
+        role.description = req.description
+    if req.is_default is not None:
+        role.is_default = req.is_default
+
+    await db.commit()
+    await db.refresh(role)
+    await log_audit(db, admin.id, "update_role", f"role={role_id}")
+    return await _build_role_response(db, role)
+
+
+@app.delete("/auth/roles/{role_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_role(
+    role_id: int,
+    admin: User = Depends(require_permission("roles:delete")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DbRole).where(DbRole.id == role_id))
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+    if role.is_system:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete system roles"
+        )
+    await db.delete(role)
+    await db.commit()
+    await log_audit(db, admin.id, "delete_role", f"role={role.name}")
+
+
+@app.put("/auth/roles/{role_id}/permissions", response_model=RoleResponse)
+async def set_role_permissions(
+    role_id: int,
+    req: RolePermissionUpdate,
+    admin: User = Depends(require_permission("roles:update")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DbRole).where(DbRole.id == role_id))
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+    if role.is_system:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify system role permissions"
+        )
+
+    # Clear existing and set new
+    await db.execute(delete(RolePermission).where(RolePermission.role_id == role_id))
+    for codename in req.permission_codenames:
+        perm_result = await db.execute(select(Permission).where(Permission.codename == codename))
+        perm = perm_result.scalar_one_or_none()
+        if perm:
+            db.add(RolePermission(role_id=role_id, permission_id=perm.id))
+    await db.commit()
+    await log_audit(db, admin.id, "set_role_permissions", f"role={role_id}")
+    return await _build_role_response(db, role)
+
+
+# ── Permissions (Phase 2) ────────────────────────
+
+
+@app.get("/auth/permissions", response_model=list[PermissionResponse])
+async def list_permissions(
+    _user: User = Depends(require_permission("permissions:list")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Permission).order_by(Permission.codename))
+    return [PermissionResponse.model_validate(p) for p in result.scalars().all()]
+
+
+@app.post("/auth/permissions/check", response_model=PermissionCheckResult)
+async def check_user_permission(
+    req: PermissionCheck,
+    _admin: User = Depends(require_permission("permissions:check")),
+    db: AsyncSession = Depends(get_db),
+):
+    from permission_service import check_permission
+
+    user_result = await db.execute(select(User).where(User.id == req.user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    allowed = await check_permission(db, user, req.permission, req.resource_type, req.resource_id)
+    return PermissionCheckResult(allowed=allowed, permission=req.permission, user_id=req.user_id)
+
+
+# ── User Role Assignments (Phase 2) ──────────────
+
+
+@app.get("/auth/users/{user_id}/roles", response_model=list[UserRoleResponse])
+async def list_user_roles(
+    user_id: int,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(UserRole, DbRole.name)
+        .join(DbRole, UserRole.role_id == DbRole.id)
+        .where(UserRole.user_id == user_id)
+    )
+    return [
+        UserRoleResponse(
+            id=ur.id,
+            user_id=ur.user_id,
+            role_id=ur.role_id,
+            role_name=name,
+            tenant_id=ur.tenant_id,
+            scope_type=ur.scope_type,
+            scope_id=ur.scope_id,
+            created_at=ur.created_at,
+        )
+        for ur, name in result.all()
+    ]
+
+
+@app.post(
+    "/auth/users/{user_id}/roles",
+    response_model=UserRoleResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def assign_user_role(
+    user_id: int,
+    req: UserRoleAssign,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    # Verify user exists
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    if not user_result.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    # Verify role exists
+    role_result = await db.execute(select(DbRole).where(DbRole.id == req.role_id))
+    role = role_result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+
+    assignment = UserRole(
+        user_id=user_id,
+        role_id=req.role_id,
+        tenant_id=req.tenant_id,
+        scope_type=req.scope_type,
+        scope_id=req.scope_id,
+        granted_by=admin.id,
+        created_at=datetime.now(UTC),
+    )
+    db.add(assignment)
+    await db.commit()
+    await db.refresh(assignment)
+    await log_audit(db, admin.id, "assign_role", f"user={user_id} role={role.name}")
+
+    return UserRoleResponse(
+        id=assignment.id,
+        user_id=assignment.user_id,
+        role_id=assignment.role_id,
+        role_name=role.name,
+        tenant_id=assignment.tenant_id,
+        scope_type=assignment.scope_type,
+        scope_id=assignment.scope_id,
+        created_at=assignment.created_at,
+    )
+
+
+@app.delete("/auth/users/{user_id}/roles/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_user_role(
+    user_id: int,
+    assignment_id: int,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(UserRole).where(UserRole.id == assignment_id, UserRole.user_id == user_id)
+    )
+    assignment = result.scalar_one_or_none()
+    if not assignment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Role assignment not found"
+        )
+    await db.delete(assignment)
+    await db.commit()
+    await log_audit(db, admin.id, "remove_role", f"user={user_id} assignment={assignment_id}")
 
 
 if __name__ == "__main__":
