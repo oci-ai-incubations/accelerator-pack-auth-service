@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     account_lockout_duration_minutes: int = 30
     max_concurrent_sessions: int = 5
 
+    # Feature flags
+    local_auth_enabled: bool = True
+    oidc_enabled: bool = False
+    saml_enabled: bool = False
+
     # First registered user auto-promoted to admin
     auto_admin_first_user: bool = True
 

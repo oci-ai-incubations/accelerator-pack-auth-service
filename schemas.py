@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field
 
-from models import PermissionLevel, Role
+from models import PermissionLevel, ProviderType, Role
 
 
 # ── Auth ──────────────────────────────────────────
@@ -142,3 +142,55 @@ class PermissionCheckResult(BaseModel):
     allowed: bool
     permission: str
     user_id: int
+
+
+# ── Identity Providers (Phase 3) ─────────────────
+class ProviderCreate(BaseModel):
+    type: ProviderType
+    name: str = Field(min_length=1, max_length=255)
+    slug: str = Field(min_length=1, max_length=100, pattern=r"^[a-z0-9-]+$")
+    config: dict = {}
+    tenant_id: int | None = None
+    is_active: bool = True
+    priority: int = 0
+
+
+class ProviderUpdate(BaseModel):
+    name: str | None = None
+    config: dict | None = None
+    is_active: bool | None = None
+    priority: int | None = None
+
+
+class ProviderResponse(BaseModel):
+    id: int
+    type: ProviderType
+    name: str
+    slug: str
+    config: dict
+    tenant_id: int | None
+    is_active: bool
+    priority: int
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ClaimMappingCreate(BaseModel):
+    claim_key: str = Field(min_length=1, max_length=255)
+    claim_value_pattern: str = Field(min_length=1, max_length=255)
+    role_id: int
+    priority: int = 0
+    is_regex: bool = False
+
+
+class ClaimMappingResponse(BaseModel):
+    id: int
+    provider_id: int
+    claim_key: str
+    claim_value_pattern: str
+    role_id: int
+    priority: int
+    is_regex: bool
+
+    model_config = {"from_attributes": True}
