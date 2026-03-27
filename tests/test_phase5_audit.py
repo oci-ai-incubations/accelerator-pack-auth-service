@@ -166,9 +166,7 @@ async def test_audit_query_with_params(client: AsyncClient):
 async def test_audit_export_endpoint(client: AsyncClient):
     token = await _get_admin_token(client)
 
-    resp = await client.get(
-        "/auth/audit/export", headers={"Authorization": f"Bearer {token}"}
-    )
+    resp = await client.get("/auth/audit/export", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
 
@@ -177,9 +175,7 @@ async def test_audit_export_endpoint(client: AsyncClient):
 async def test_audit_purge_endpoint(client: AsyncClient):
     token = await _get_admin_token(client)
 
-    resp = await client.post(
-        "/auth/audit/purge", headers={"Authorization": f"Bearer {token}"}
-    )
+    resp = await client.post("/auth/audit/purge", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert "deleted" in resp.json()
 
@@ -194,7 +190,5 @@ async def test_non_admin_cannot_query_audit(client: AsyncClient):
     )
     user_token = user.json()["access_token"]
 
-    resp = await client.get(
-        "/auth/audit", headers={"Authorization": f"Bearer {user_token}"}
-    )
+    resp = await client.get("/auth/audit", headers={"Authorization": f"Bearer {user_token}"})
     assert resp.status_code == 403

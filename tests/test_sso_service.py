@@ -77,7 +77,6 @@ async def test_jit_provision_existing_external_identity(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_jit_provision_links_existing_email(db: AsyncSession):
-
     from sso_service import jit_provision_user
 
     # Create a user manually (e.g., registered via local auth)
@@ -109,7 +108,6 @@ async def test_jit_provision_links_existing_email(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_apply_claim_mappings_exact_match(db: AsyncSession):
-
     from models import ClaimRoleMapping
     from sso_service import apply_claim_mappings
 
