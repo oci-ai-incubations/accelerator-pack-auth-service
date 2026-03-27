@@ -13,6 +13,11 @@ TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
 os.environ["AUTH_DATABASE_URL"] = TEST_DB_URL
 os.environ["AUTH_JWT_SECRET"] = "test-secret"
+os.environ["AUTH_RATE_LIMIT_LOGIN"] = "1000/minute"
+os.environ["AUTH_RATE_LIMIT_REGISTER"] = "1000/minute"
+os.environ["AUTH_ACCOUNT_LOCKOUT_THRESHOLD"] = "3"
+os.environ["AUTH_ACCOUNT_LOCKOUT_DURATION_MINUTES"] = "30"
+os.environ["AUTH_MAX_CONCURRENT_SESSIONS"] = "5"
 
 
 @pytest.fixture(scope="session")
