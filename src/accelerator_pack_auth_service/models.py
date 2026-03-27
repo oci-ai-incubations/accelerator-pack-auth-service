@@ -1,8 +1,8 @@
 import enum
+import json as json_lib
 from datetime import UTC, datetime
 
 from sqlalchemy import (
-    JSON,
     Boolean,
     Column,
     DateTime,
@@ -13,9 +13,27 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
+
+
+class JSONText(TypeDecorator):
+    """JSON stored as Text — works on all databases including Oracle."""
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None:
+            return json_lib.dumps(value)
+        return None
+
+    def process_result_value(self, value, dialect):
+        if value is not None:
+            return json_lib.loads(value)
+        return None
 
 
 class Base(DeclarativeBase):
@@ -111,7 +129,7 @@ class Tenant(Base):
     name = Column(String(255), nullable=False)
     slug = Column(String(100), unique=True, nullable=False, index=True)
     is_active = Column(Boolean, nullable=False, default=True)
-    settings = Column(JSON, nullable=True)
+    settings = Column(JSONText, nullable=True)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
 
 
@@ -229,7 +247,7 @@ class IdentityProvider(Base):
     type = Column(Enum(ProviderType), nullable=False)
     name = Column(String(255), nullable=False)
     slug = Column(String(100), unique=True, nullable=False, index=True)
-    config = Column(JSON, nullable=False, default=dict)
+    config = Column(JSONText, nullable=False, default=dict)
     is_active = Column(Boolean, nullable=False, default=True)
     priority = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
@@ -249,7 +267,7 @@ class ExternalIdentity(Base):
     )
     external_id = Column(String(255), nullable=False)
     email = Column(String(320), nullable=True)
-    raw_claims = Column(JSON, nullable=True)
+    raw_claims = Column(JSONText, nullable=True)
     last_login_at = Column(DateTime, nullable=True)
 
     user = relationship("User")
@@ -342,7 +360,7 @@ class AuditLog(Base):
     target_type = Column(String(100), nullable=True)
     target_id = Column(String(255), nullable=True)
     tenant_id = Column(Integer, nullable=True)
-    details = Column(JSON, nullable=True)
+    details = Column(JSONText, nullable=True)
     ip_address = Column(String(45), nullable=True)
     user_agent = Column(String(500), nullable=True)
     result = Column(Enum(AuditResult), nullable=False, default=AuditResult.success)
