@@ -78,7 +78,7 @@ async def seed_roles_and_permissions(db: AsyncSession) -> None:
     # Seed roles
     for role_name, role_def in SYSTEM_ROLES.items():
         existing = await db.execute(
-            select(DbRole).where(DbRole.name == role_name, DbRole.is_system.is_(True))
+            select(DbRole).where(DbRole.name == role_name, DbRole.is_system == 1)
         )
         role = existing.scalar_one_or_none()
         if not role:
@@ -155,7 +155,7 @@ async def check_permission(
         .join(DbRole, DbRole.id == RolePermission.role_id)
         .where(
             DbRole.name == user.role.value,
-            DbRole.is_system.is_(True),
+            DbRole.is_system == 1,
             Permission.codename == permission_codename,
         )
     )
