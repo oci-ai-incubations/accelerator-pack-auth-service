@@ -1,6 +1,16 @@
+[project]
+name = "accelerator-pack-auth-service"
+version = "1.0.0"
+description = "Enterprise auth/authz service for OCI AI Accelerator packs"
+requires-python = ">=3.12"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "S", "B", "UP"]
@@ -12,3 +22,9 @@ ignore = ["S105", "S106", "B008"]  # S10x: test fixtures, B008: FastAPI Depends(
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["accelerator_pack_auth_service"]
+
+[tool.coverage.report]
+fail_under = 70

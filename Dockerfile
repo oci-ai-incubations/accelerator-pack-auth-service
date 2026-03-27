@@ -5,8 +5,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY src/ src/
+COPY alembic/ alembic/
+COPY alembic.ini .
 
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "accelerator_pack_auth_service.main:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from auth import create_access_token, create_refresh_token_value, store_refresh_token
-from models import (
+from .auth import create_access_token, create_refresh_token_value, store_refresh_token
+from .models import (
     ClaimRoleMapping,
     DbRole,
     ExternalIdentity,

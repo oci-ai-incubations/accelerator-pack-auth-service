@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import (
+from .models import (
     DbRole,
     DirectGrant,
     Permission,

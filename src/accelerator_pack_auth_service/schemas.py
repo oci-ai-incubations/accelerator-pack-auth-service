@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field
 
-from models import PermissionLevel, ProviderType, Role
+from .models import PermissionLevel, ProviderType, Role
 
 
 # ── Auth ──────────────────────────────────────────

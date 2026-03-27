@@ -5,7 +5,15 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from models import Base, DbRole, ExternalIdentity, IdentityProvider, Role, User, UserRole
+from accelerator_pack_auth_service.models import (
+    Base,
+    DbRole,
+    ExternalIdentity,
+    IdentityProvider,
+    Role,
+    User,
+    UserRole,
+)
 
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -18,7 +26,7 @@ async def db():
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     # Seed roles
     async with session_factory() as session:
-        from permission_service import seed_roles_and_permissions
+        from accelerator_pack_auth_service.permission_service import seed_roles_and_permissions
 
         await seed_roles_and_permissions(session)
     async with session_factory() as session:
@@ -44,7 +52,7 @@ async def _create_provider(db: AsyncSession) -> IdentityProvider:
 
 @pytest.mark.asyncio
 async def test_jit_provision_new_user(db: AsyncSession):
-    from sso_service import jit_provision_user
+    from accelerator_pack_auth_service.sso_service import jit_provision_user
 
     provider = await _create_provider(db)
     user, created = await jit_provision_user(
@@ -57,7 +65,7 @@ async def test_jit_provision_new_user(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_jit_provision_existing_external_identity(db: AsyncSession):
-    from sso_service import jit_provision_user
+    from accelerator_pack_auth_service.sso_service import jit_provision_user
 
     provider = await _create_provider(db)
 
@@ -77,7 +85,7 @@ async def test_jit_provision_existing_external_identity(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_jit_provision_links_existing_email(db: AsyncSession):
-    from sso_service import jit_provision_user
+    from accelerator_pack_auth_service.sso_service import jit_provision_user
 
     # Create a user manually (e.g., registered via local auth)
     existing = User(
@@ -108,8 +116,8 @@ async def test_jit_provision_links_existing_email(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_apply_claim_mappings_exact_match(db: AsyncSession):
-    from models import ClaimRoleMapping
-    from sso_service import apply_claim_mappings
+    from accelerator_pack_auth_service.models import ClaimRoleMapping
+    from accelerator_pack_auth_service.sso_service import apply_claim_mappings
 
     provider = await _create_provider(db)
 
@@ -145,8 +153,8 @@ async def test_apply_claim_mappings_exact_match(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_apply_claim_mappings_regex(db: AsyncSession):
-    from models import ClaimRoleMapping
-    from sso_service import apply_claim_mappings
+    from accelerator_pack_auth_service.models import ClaimRoleMapping
+    from accelerator_pack_auth_service.sso_service import apply_claim_mappings
 
     provider = await _create_provider(db)
 
@@ -176,7 +184,7 @@ async def test_apply_claim_mappings_regex(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_apply_claim_mappings_no_match(db: AsyncSession):
-    from sso_service import apply_claim_mappings
+    from accelerator_pack_auth_service.sso_service import apply_claim_mappings
 
     provider = await _create_provider(db)
     user = User(email="nomatch@test.com", name="NoMatch", password_hash="x", role=Role.user)
@@ -190,7 +198,7 @@ async def test_apply_claim_mappings_no_match(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_issue_sso_tokens(db: AsyncSession):
-    from sso_service import issue_sso_tokens
+    from accelerator_pack_auth_service.sso_service import issue_sso_tokens
 
     user = User(email="tokens@test.com", name="Tokens", password_hash="x", role=Role.user)
     db.add(user)

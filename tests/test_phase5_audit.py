@@ -5,7 +5,7 @@ import pytest_asyncio
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from models import Base
+from accelerator_pack_auth_service.models import Base
 
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -34,7 +34,7 @@ async def audit_db():
 
 @pytest.mark.asyncio
 async def test_log_event(audit_db: AsyncSession):
-    from audit_service import log_event
+    from accelerator_pack_auth_service.audit_service import log_event
 
     entry = await log_event(
         audit_db,
@@ -51,7 +51,7 @@ async def test_log_event(audit_db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_query_audit_logs_with_filters(audit_db: AsyncSession):
-    from audit_service import log_event, query_audit_logs
+    from accelerator_pack_auth_service.audit_service import log_event, query_audit_logs
 
     await log_event(audit_db, "user.login", actor_user_id=1)
     await log_event(audit_db, "user.login", actor_user_id=2)
@@ -68,7 +68,7 @@ async def test_query_audit_logs_with_filters(audit_db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_query_audit_logs_pagination(audit_db: AsyncSession):
-    from audit_service import log_event, query_audit_logs
+    from accelerator_pack_auth_service.audit_service import log_event, query_audit_logs
 
     for i in range(10):
         await log_event(audit_db, "test.event", actor_user_id=i)
@@ -85,7 +85,7 @@ async def test_query_audit_logs_pagination(audit_db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_audit_log_to_dict(audit_db: AsyncSession):
-    from audit_service import audit_log_to_dict, log_event
+    from accelerator_pack_auth_service.audit_service import audit_log_to_dict, log_event
 
     entry = await log_event(
         audit_db,
@@ -105,8 +105,8 @@ async def test_audit_log_to_dict(audit_db: AsyncSession):
 async def test_purge_old_logs(audit_db: AsyncSession):
     from datetime import UTC, datetime, timedelta
 
-    from audit_service import purge_old_logs
-    from models import AuditLog, AuditResult
+    from accelerator_pack_auth_service.audit_service import purge_old_logs
+    from accelerator_pack_auth_service.models import AuditLog, AuditResult
 
     # Insert an old entry directly
     old = AuditLog(

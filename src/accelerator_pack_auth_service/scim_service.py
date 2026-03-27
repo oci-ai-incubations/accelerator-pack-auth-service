@@ -8,8 +8,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
-from models import Group, GroupMembership, GroupSource, Role, User
+from .config import settings
+from .models import Group, GroupMembership, GroupSource, Role, User
 
 scim_bearer = HTTPBearer()
 

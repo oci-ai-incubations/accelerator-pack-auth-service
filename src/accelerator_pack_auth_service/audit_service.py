@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
-from models import AuditLog, AuditResult
+from .config import settings
+from .models import AuditLog, AuditResult
 
 
 async def log_event(

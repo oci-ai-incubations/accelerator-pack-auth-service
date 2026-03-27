@@ -10,9 +10,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
-from database import get_db
-from models import FailedLoginAttempt, RefreshToken, Role, TokenBlacklist, User
+from .config import settings
+from .database import get_db
+from .models import FailedLoginAttempt, RefreshToken, Role, TokenBlacklist, User
 
 security = HTTPBearer()
 
@@ -139,7 +139,7 @@ def require_permission(permission_codename: str):
         user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
     ) -> User:
-        from permission_service import check_permission
+        from .permission_service import check_permission
 
         has_perm = await check_permission(db, user, permission_codename)
         if not has_perm:
@@ -194,7 +194,7 @@ async def enforce_session_limit(db: AsyncSession, user_id: int) -> None:
 
 
 async def log_audit(db: AsyncSession, user_id: int, action: str, target: str = "") -> None:
-    from models import AuditLog, AuditResult
+    from .models import AuditLog, AuditResult
 
     entry = AuditLog(
         user_id=user_id,
