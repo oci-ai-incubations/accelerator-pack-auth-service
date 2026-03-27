@@ -132,6 +132,26 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+def require_permission(permission_codename: str):
+    """Factory that returns a FastAPI dependency checking a specific permission."""
+
+    async def _check(
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ) -> User:
+        from permission_service import check_permission
+
+        has_perm = await check_permission(db, user, permission_codename)
+        if not has_perm:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Missing required permission: {permission_codename}",
+            )
+        return user
+
+    return _check
+
+
 async def record_failed_login(db: AsyncSession, email: str, ip_address: str | None = None) -> None:
     attempt = FailedLoginAttempt(email=email, ip_address=ip_address)
     db.add(attempt)

@@ -70,3 +70,75 @@ class CollectionPermissionResponse(BaseModel):
 class MyCollectionAccess(BaseModel):
     collection_id: str
     permission_level: PermissionLevel
+
+
+# ── Roles & Permissions (Phase 2) ────────────────
+class RoleCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str | None = None
+    tenant_id: int | None = None
+
+
+class RoleUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    is_default: bool | None = None
+
+
+class RoleResponse(BaseModel):
+    id: int
+    name: str
+    description: str | None
+    is_system: bool
+    is_default: bool
+    tenant_id: int | None
+    permissions: list[str] = []
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class PermissionResponse(BaseModel):
+    id: int
+    codename: str
+    description: str | None
+    resource_type: str | None
+
+    model_config = {"from_attributes": True}
+
+
+class RolePermissionUpdate(BaseModel):
+    permission_codenames: list[str]
+
+
+class UserRoleAssign(BaseModel):
+    role_id: int
+    tenant_id: int | None = None
+    scope_type: str | None = None
+    scope_id: str | None = None
+
+
+class UserRoleResponse(BaseModel):
+    id: int
+    user_id: int
+    role_id: int
+    role_name: str
+    tenant_id: int | None
+    scope_type: str | None
+    scope_id: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class PermissionCheck(BaseModel):
+    user_id: int
+    permission: str
+    resource_type: str | None = None
+    resource_id: str | None = None
+
+
+class PermissionCheckResult(BaseModel):
+    allowed: bool
+    permission: str
+    user_id: int
