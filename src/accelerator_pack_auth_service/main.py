@@ -8,8 +8,8 @@ from slowapi.util import get_remote_address
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import scim_service
-from auth import (
+from . import scim_service
+from .auth import (
     blacklist_token,
     check_account_lockout,
     clear_failed_attempts,
@@ -28,9 +28,9 @@ from auth import (
     validate_refresh_token,
     verify_password,
 )
-from config import settings
-from database import get_db, init_db
-from models import (
+from .config import settings
+from .database import get_db, init_db
+from .models import (
     ClaimRoleMapping,
     CollectionPermission,
     DbRole,
@@ -41,7 +41,7 @@ from models import (
     User,
     UserRole,
 )
-from schemas import (
+from .schemas import (
     ClaimMappingCreate,
     ClaimMappingResponse,
     CollectionPermissionRequest,
@@ -75,8 +75,8 @@ limiter = Limiter(key_func=get_remote_address)
 async def lifespan(_app: FastAPI):
     await init_db()
     # Seed system roles and permissions
-    from database import async_session
-    from permission_service import seed_roles_and_permissions
+    from .database import async_session
+    from .permission_service import seed_roles_and_permissions
 
     async with async_session() as db:
         await seed_roles_and_permissions(db)
@@ -591,7 +591,7 @@ async def check_user_permission(
     _admin: User = Depends(require_permission("permissions:check")),
     db: AsyncSession = Depends(get_db),
 ):
-    from permission_service import check_permission
+    from .permission_service import check_permission
 
     user_result = await db.execute(select(User).where(User.id == req.user_id))
     user = user_result.scalar_one_or_none()
@@ -902,7 +902,7 @@ async def sso_callback(
     if not provider:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
 
-    from sso_service import apply_claim_mappings, issue_sso_tokens, jit_provision_user
+    from .sso_service import apply_claim_mappings, issue_sso_tokens, jit_provision_user
 
     user, _created = await jit_provision_user(
         db,
@@ -928,7 +928,7 @@ async def list_groups(
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import Group
+    from .models import Group
 
     result = await db.execute(select(Group).order_by(Group.name))
     groups = result.scalars().all()
@@ -950,7 +950,7 @@ async def create_group(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import Group
+    from .models import Group
 
     body = await request.json()
     group = Group(
@@ -972,7 +972,7 @@ async def list_group_members(
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import GroupMembership
+    from .models import GroupMembership
 
     result = await db.execute(
         select(User)
@@ -989,7 +989,7 @@ async def add_group_member(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import GroupMembership
+    from .models import GroupMembership
 
     body = await request.json()
     user_id = body["user_id"]
@@ -1009,7 +1009,7 @@ async def remove_group_member(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import GroupMembership
+    from .models import GroupMembership
 
     result = await db.execute(
         select(GroupMembership).where(
@@ -1031,7 +1031,7 @@ async def set_group_roles(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import GroupRole
+    from .models import GroupRole
 
     body = await request.json()
     role_ids = body.get("role_ids", [])
@@ -1140,7 +1140,7 @@ async def scim_list_groups(
     _token: str = Depends(scim_service.require_scim_auth),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import Group
+    from .models import Group
 
     result = await db.execute(select(Group).order_by(Group.id))
     groups = result.scalars().all()
@@ -1168,7 +1168,7 @@ async def scim_get_group(
     _token: str = Depends(scim_service.require_scim_auth),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import Group
+    from .models import Group
 
     result = await db.execute(select(Group).where(Group.id == group_id))
     group = result.scalar_one_or_none()
@@ -1184,7 +1184,7 @@ async def scim_replace_group(
     _token: str = Depends(scim_service.require_scim_auth),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import Group
+    from .models import Group
 
     result = await db.execute(select(Group).where(Group.id == group_id))
     group = result.scalar_one_or_none()
@@ -1201,7 +1201,7 @@ async def scim_delete_group(
     _token: str = Depends(scim_service.require_scim_auth),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import Group
+    from .models import Group
 
     result = await db.execute(select(Group).where(Group.id == group_id))
     group = result.scalar_one_or_none()
@@ -1220,7 +1220,7 @@ async def query_audit(
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from audit_service import audit_log_to_dict, query_audit_logs
+    from .audit_service import audit_log_to_dict, query_audit_logs
 
     params = request.query_params
     logs, total = await query_audit_logs(
@@ -1247,7 +1247,7 @@ async def export_audit(
     db: AsyncSession = Depends(get_db),
 ):
     """Export all audit logs as JSON array (for streaming, use NDJSON in production)."""
-    from audit_service import audit_log_to_dict, query_audit_logs
+    from .audit_service import audit_log_to_dict, query_audit_logs
 
     logs, _ = await query_audit_logs(db, limit=10000)
     return [audit_log_to_dict(log) for log in logs]
@@ -1258,7 +1258,7 @@ async def purge_audit(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from audit_service import purge_old_logs
+    from .audit_service import purge_old_logs
 
     deleted = await purge_old_logs(db)
     await log_audit(db, admin.id, "purge_audit", f"deleted={deleted}")
@@ -1273,7 +1273,7 @@ async def admin_status(
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from models import Group, IdentityProvider, RefreshToken
+    from .models import Group, IdentityProvider, RefreshToken
 
     user_count = await db.scalar(select(func.count()).select_from(User))
     active_users = await db.scalar(

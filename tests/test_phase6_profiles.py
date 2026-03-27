@@ -56,7 +56,7 @@ async def test_admin_status_requires_admin(client: AsyncClient):
 
 
 def test_profile_presets_exist():
-    from config import PROFILE_PRESETS
+    from accelerator_pack_auth_service.config import PROFILE_PRESETS
 
     assert "minimal" in PROFILE_PRESETS
     assert "standard" in PROFILE_PRESETS
@@ -64,7 +64,7 @@ def test_profile_presets_exist():
 
 
 def test_minimal_profile_disables_sso():
-    from config import PROFILE_PRESETS
+    from accelerator_pack_auth_service.config import PROFILE_PRESETS
 
     minimal = PROFILE_PRESETS["minimal"]
     assert minimal["oidc_enabled"] is False
@@ -73,7 +73,7 @@ def test_minimal_profile_disables_sso():
 
 
 def test_enterprise_profile_enables_all():
-    from config import PROFILE_PRESETS
+    from accelerator_pack_auth_service.config import PROFILE_PRESETS
 
     enterprise = PROFILE_PRESETS["enterprise"]
     assert enterprise["oidc_enabled"] is True

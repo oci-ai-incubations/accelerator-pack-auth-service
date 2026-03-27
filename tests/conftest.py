@@ -6,7 +6,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from models import Base
+from accelerator_pack_auth_service.models import Base
 
 # Use in-memory SQLite for tests
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
@@ -38,7 +38,7 @@ async def db_engine():
     # Seed system roles and permissions for RBAC tests
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
-        from permission_service import seed_roles_and_permissions
+        from accelerator_pack_auth_service.permission_service import seed_roles_and_permissions
 
         await seed_roles_and_permissions(session)
     yield engine
@@ -57,7 +57,7 @@ async def db_session(db_engine):
 @pytest_asyncio.fixture
 async def client(db_engine):
     """Create a test client with a fresh database."""
-    from database import get_db
+    from accelerator_pack_auth_service.database import get_db
 
     session_factory = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -65,7 +65,7 @@ async def client(db_engine):
         async with session_factory() as session:
             yield session
 
-    from main import app
+    from accelerator_pack_auth_service.main import app
 
     app.dependency_overrides[get_db] = override_get_db
 
