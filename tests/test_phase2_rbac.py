@@ -99,9 +99,7 @@ async def test_non_admin_cannot_list_permissions(client: AsyncClient):
     """Non-admin user should be denied access to permissions list."""
     admin_token = await _get_admin_token(client)
     user_token, _ = await _get_user_token(client, admin_token)
-    resp = await client.get(
-        "/auth/permissions", headers={"Authorization": f"Bearer {user_token}"}
-    )
+    resp = await client.get("/auth/permissions", headers={"Authorization": f"Bearer {user_token}"})
     assert resp.status_code == 403
 
 

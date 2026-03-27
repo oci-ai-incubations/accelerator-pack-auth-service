@@ -20,9 +20,7 @@ os.environ["AUTH_ACCOUNT_LOCKOUT_DURATION_MINUTES"] = "30"
 os.environ["AUTH_MAX_CONCURRENT_SESSIONS"] = "5"
 os.environ["AUTH_SCIM_ENABLED"] = "true"
 # SHA256 hash of "test-scim-token"
-os.environ["AUTH_SCIM_TOKEN"] = (
-    "96d72274517e0d926344cee50c7da354c52ccf06fb22fc45a34958db62a84d4f"
-)
+os.environ["AUTH_SCIM_TOKEN"] = "96d72274517e0d926344cee50c7da354c52ccf06fb22fc45a34958db62a84d4f"
 
 
 @pytest.fixture(scope="session")
