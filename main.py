@@ -83,7 +83,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="aRBi Auth Service", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="aRBi Auth Service", version="1.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 # CORS — configurable via AUTH_CORS_ORIGINS
@@ -130,7 +130,7 @@ def _build_token_response(access_token: str, refresh_token: str, user: User) -> 
 
 @app.get("/auth/health")
 async def health():
-    return {"status": "healthy", "service": "auth", "version": "3.0.0"}
+    return {"status": "healthy", "service": "auth", "version": "1.0.0"}
 
 
 @app.get("/auth/alive")
@@ -1263,6 +1263,46 @@ async def purge_audit(
     deleted = await purge_old_logs(db)
     await log_audit(db, admin.id, "purge_audit", f"deleted={deleted}")
     return {"deleted": deleted}
+
+
+# ── Admin Dashboard (Phase 6) ────────────────────
+
+
+@app.get("/auth/admin/status")
+async def admin_status(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import Group, IdentityProvider, RefreshToken
+
+    user_count = await db.scalar(select(func.count()).select_from(User))
+    active_users = await db.scalar(
+        select(func.count()).select_from(User).where(User.is_active.is_(True))
+    )
+    active_sessions = await db.scalar(
+        select(func.count()).select_from(RefreshToken).where(RefreshToken.revoked.is_(False))
+    )
+    provider_count = await db.scalar(select(func.count()).select_from(IdentityProvider))
+    group_count = await db.scalar(select(func.count()).select_from(Group))
+
+    return {
+        "version": "1.0.0",
+        "profile": settings.profile,
+        "features": {
+            "local_auth": settings.local_auth_enabled,
+            "oidc": settings.oidc_enabled,
+            "saml": settings.saml_enabled,
+            "scim": settings.scim_enabled,
+            "audit": settings.audit_enabled,
+        },
+        "stats": {
+            "total_users": user_count,
+            "active_users": active_users,
+            "active_sessions": active_sessions,
+            "identity_providers": provider_count,
+            "groups": group_count,
+        },
+    }
 
 
 if __name__ == "__main__":

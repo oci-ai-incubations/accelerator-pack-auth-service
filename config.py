@@ -1,5 +1,30 @@
 from pydantic_settings import BaseSettings
 
+# Profile presets: which features are enabled by default per profile
+PROFILE_PRESETS = {
+    "minimal": {
+        "local_auth_enabled": True,
+        "oidc_enabled": False,
+        "saml_enabled": False,
+        "scim_enabled": False,
+        "audit_enabled": False,
+    },
+    "standard": {
+        "local_auth_enabled": True,
+        "oidc_enabled": True,
+        "saml_enabled": False,
+        "scim_enabled": False,
+        "audit_enabled": True,
+    },
+    "enterprise": {
+        "local_auth_enabled": True,
+        "oidc_enabled": True,
+        "saml_enabled": True,
+        "scim_enabled": True,
+        "audit_enabled": True,
+    },
+}
+
 
 class Settings(BaseSettings):
     # Database — supports sqlite+aiosqlite://, postgresql+asyncpg://
@@ -36,10 +61,22 @@ class Settings(BaseSettings):
     audit_enabled: bool = True
     audit_retention_days: int = 90
 
+    # Profile: minimal|standard|enterprise|custom
+    profile: str = "custom"
+
     # First registered user auto-promoted to admin
     auto_admin_first_user: bool = True
 
     model_config = {"env_prefix": "AUTH_"}
+
+    def model_post_init(self, __context):
+        """Apply profile presets if profile is not 'custom'."""
+        if self.profile in PROFILE_PRESETS:
+            preset = PROFILE_PRESETS[self.profile]
+            for key, value in preset.items():
+                # Only apply preset if env var wasn't explicitly set
+                if key not in (self.model_fields_set or set()):
+                    object.__setattr__(self, key, value)
 
 
 settings = Settings()
