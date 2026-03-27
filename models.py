@@ -277,6 +277,55 @@ class ClaimRoleMapping(Base):
     role = relationship("DbRole")
 
 
+# ── Phase 4: SCIM Groups ─────────────────────────
+
+
+class GroupSource(enum.StrEnum):
+    local = "local"
+    scim = "scim"
+    jit = "jit"
+
+
+class Group(Base):
+    __tablename__ = "groups"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
+    name = Column(String(255), nullable=False)
+    display_name = Column(String(255), nullable=True)
+    description = Column(String(500), nullable=True)
+    external_id = Column(String(255), nullable=True)
+    source = Column(Enum(GroupSource), nullable=False, default=GroupSource.local)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    updated_at = Column(DateTime, nullable=True, onupdate=lambda: datetime.now(UTC))
+
+    memberships = relationship(
+        "GroupMembership", back_populates="group", cascade="all, delete-orphan"
+    )
+    roles = relationship("GroupRole", back_populates="group", cascade="all, delete-orphan")
+
+
+class GroupMembership(Base):
+    __tablename__ = "group_memberships"
+
+    group_id = Column(Integer, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+
+    group = relationship("Group", back_populates="memberships")
+    user = relationship("User")
+
+
+class GroupRole(Base):
+    __tablename__ = "group_roles"
+
+    group_id = Column(Integer, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
+    role_id = Column(Integer, ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
+
+    group = relationship("Group", back_populates="roles")
+    role = relationship("DbRole")
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

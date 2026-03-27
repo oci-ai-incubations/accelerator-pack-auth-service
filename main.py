@@ -8,6 +8,7 @@ from slowapi.util import get_remote_address
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import scim_service
 from auth import (
     blacklist_token,
     check_account_lockout,
@@ -917,6 +918,297 @@ async def sso_callback(
 
     access_token, refresh_value = await issue_sso_tokens(db, user)
     return _build_token_response(access_token, refresh_value, user)
+
+
+# ── Groups (Phase 4, admin) ───────────────────────
+
+
+@app.get("/auth/groups")
+async def list_groups(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import Group
+
+    result = await db.execute(select(Group).order_by(Group.name))
+    groups = result.scalars().all()
+    return [
+        {
+            "id": g.id,
+            "name": g.name,
+            "display_name": g.display_name,
+            "source": g.source.value if g.source else "local",
+            "external_id": g.external_id,
+        }
+        for g in groups
+    ]
+
+
+@app.post("/auth/groups", status_code=status.HTTP_201_CREATED)
+async def create_group(
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import Group
+
+    body = await request.json()
+    group = Group(
+        name=body["name"],
+        display_name=body.get("display_name", body["name"]),
+        description=body.get("description"),
+        created_at=datetime.now(UTC),
+    )
+    db.add(group)
+    await db.commit()
+    await db.refresh(group)
+    await log_audit(db, admin.id, "create_group", f"group={group.name}")
+    return {"id": group.id, "name": group.name, "display_name": group.display_name}
+
+
+@app.get("/auth/groups/{group_id}/members")
+async def list_group_members(
+    group_id: int,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import GroupMembership
+
+    result = await db.execute(
+        select(User)
+        .join(GroupMembership, GroupMembership.user_id == User.id)
+        .where(GroupMembership.group_id == group_id)
+    )
+    return [UserResponse.model_validate(u) for u in result.scalars().all()]
+
+
+@app.post("/auth/groups/{group_id}/members", status_code=status.HTTP_201_CREATED)
+async def add_group_member(
+    group_id: int,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import GroupMembership
+
+    body = await request.json()
+    user_id = body["user_id"]
+    db.add(GroupMembership(group_id=group_id, user_id=user_id))
+    await db.commit()
+    await log_audit(db, admin.id, "add_group_member", f"group={group_id} user={user_id}")
+    return {"group_id": group_id, "user_id": user_id}
+
+
+@app.delete(
+    "/auth/groups/{group_id}/members/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def remove_group_member(
+    group_id: int,
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import GroupMembership
+
+    result = await db.execute(
+        select(GroupMembership).where(
+            GroupMembership.group_id == group_id,
+            GroupMembership.user_id == user_id,
+        )
+    )
+    membership = result.scalar_one_or_none()
+    if not membership:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Membership not found")
+    await db.delete(membership)
+    await db.commit()
+
+
+@app.put("/auth/groups/{group_id}/roles")
+async def set_group_roles(
+    group_id: int,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import GroupRole
+
+    body = await request.json()
+    role_ids = body.get("role_ids", [])
+
+    # Clear existing
+    await db.execute(delete(GroupRole).where(GroupRole.group_id == group_id))
+
+    for rid in role_ids:
+        db.add(GroupRole(group_id=group_id, role_id=rid))
+    await db.commit()
+    await log_audit(db, admin.id, "set_group_roles", f"group={group_id}")
+    return {"group_id": group_id, "role_ids": role_ids}
+
+
+# ── SCIM 2.0 (Phase 4) ──────────────────────────
+
+
+@app.get("/scim/v2/ServiceProviderConfig")
+async def scim_service_provider_config(
+    _token: str = Depends(scim_service.require_scim_auth),
+):
+    return scim_service.SCIM_SERVICE_PROVIDER_CONFIG
+
+
+@app.get("/scim/v2/Schemas")
+async def scim_schemas(_token: str = Depends(scim_service.require_scim_auth)):
+    return scim_service.SCIM_SCHEMAS
+
+
+@app.get("/scim/v2/ResourceTypes")
+async def scim_resource_types(_token: str = Depends(scim_service.require_scim_auth)):
+    return scim_service.SCIM_RESOURCE_TYPES
+
+
+@app.get("/scim/v2/Users")
+async def scim_list_users(
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).order_by(User.id))
+    users = result.scalars().all()
+    return {
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+        "totalResults": len(users),
+        "Resources": [scim_service.user_to_scim(u) for u in users],
+    }
+
+
+@app.post("/scim/v2/Users", status_code=status.HTTP_201_CREATED)
+async def scim_create_user_endpoint(
+    request: Request,
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    data = await request.json()
+    user = await scim_service.scim_create_user(db, data)
+    return scim_service.user_to_scim(user)
+
+
+@app.get("/scim/v2/Users/{user_id}")
+async def scim_get_user(
+    user_id: int,
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return scim_service.user_to_scim(user)
+
+
+@app.put("/scim/v2/Users/{user_id}")
+async def scim_replace_user(
+    user_id: int,
+    request: Request,
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    data = await request.json()
+    user = await scim_service.scim_update_user(db, user, data)
+    return scim_service.user_to_scim(user)
+
+
+@app.delete("/scim/v2/Users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def scim_delete_user(
+    user_id: int,
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    user.is_active = False
+    await db.commit()
+    await revoke_user_tokens(db, user.id)
+
+
+@app.get("/scim/v2/Groups")
+async def scim_list_groups(
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import Group
+
+    result = await db.execute(select(Group).order_by(Group.id))
+    groups = result.scalars().all()
+    return {
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+        "totalResults": len(groups),
+        "Resources": [scim_service.group_to_scim(g) for g in groups],
+    }
+
+
+@app.post("/scim/v2/Groups", status_code=status.HTTP_201_CREATED)
+async def scim_create_group_endpoint(
+    request: Request,
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    data = await request.json()
+    group = await scim_service.scim_create_group(db, data)
+    return scim_service.group_to_scim(group)
+
+
+@app.get("/scim/v2/Groups/{group_id}")
+async def scim_get_group(
+    group_id: int,
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import Group
+
+    result = await db.execute(select(Group).where(Group.id == group_id))
+    group = result.scalar_one_or_none()
+    if not group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    return scim_service.group_to_scim(group)
+
+
+@app.put("/scim/v2/Groups/{group_id}")
+async def scim_replace_group(
+    group_id: int,
+    request: Request,
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import Group
+
+    result = await db.execute(select(Group).where(Group.id == group_id))
+    group = result.scalar_one_or_none()
+    if not group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    data = await request.json()
+    group = await scim_service.scim_update_group(db, group, data)
+    return scim_service.group_to_scim(group)
+
+
+@app.delete("/scim/v2/Groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def scim_delete_group(
+    group_id: int,
+    _token: str = Depends(scim_service.require_scim_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    from models import Group
+
+    result = await db.execute(select(Group).where(Group.id == group_id))
+    group = result.scalar_one_or_none()
+    if not group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    await db.delete(group)
+    await db.commit()
 
 
 if __name__ == "__main__":
