@@ -1211,6 +1211,60 @@ async def scim_delete_group(
     await db.commit()
 
 
+# ── Audit (Phase 5) ──────────────────────────────
+
+
+@app.get("/auth/audit")
+async def query_audit(
+    request: Request,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from audit_service import audit_log_to_dict, query_audit_logs
+
+    params = request.query_params
+    logs, total = await query_audit_logs(
+        db,
+        event_type=params.get("event_type"),
+        actor_user_id=int(params["actor_user_id"]) if params.get("actor_user_id") else None,
+        target_type=params.get("target_type"),
+        target_id=params.get("target_id"),
+        result_filter=params.get("result"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params.get("limit", 50)),
+    )
+    return {
+        "items": [audit_log_to_dict(log) for log in logs],
+        "total": total,
+        "offset": int(params.get("offset", 0)),
+        "limit": int(params.get("limit", 50)),
+    }
+
+
+@app.get("/auth/audit/export")
+async def export_audit(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Export all audit logs as JSON array (for streaming, use NDJSON in production)."""
+    from audit_service import audit_log_to_dict, query_audit_logs
+
+    logs, _ = await query_audit_logs(db, limit=10000)
+    return [audit_log_to_dict(log) for log in logs]
+
+
+@app.post("/auth/audit/purge")
+async def purge_audit(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from audit_service import purge_old_logs
+
+    deleted = await purge_old_logs(db)
+    await log_audit(db, admin.id, "purge_audit", f"deleted={deleted}")
+    return {"deleted": deleted}
+
+
 if __name__ == "__main__":
     import uvicorn
 

@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     saml_enabled: bool = False
     scim_enabled: bool = False
     scim_token: str = ""  # Hashed SCIM bearer token for provisioning
+    audit_enabled: bool = True
+    audit_retention_days: int = 90
 
     # First registered user auto-promoted to admin
     auto_admin_first_user: bool = True

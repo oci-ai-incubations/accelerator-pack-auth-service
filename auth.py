@@ -194,8 +194,18 @@ async def enforce_session_limit(db: AsyncSession, user_id: int) -> None:
 
 
 async def log_audit(db: AsyncSession, user_id: int, action: str, target: str = "") -> None:
-    from models import AuditLog
+    from models import AuditLog, AuditResult
 
-    entry = AuditLog(user_id=user_id, action=action, target=target)
+    entry = AuditLog(
+        user_id=user_id,
+        action=action,
+        target=target,
+        # Phase 5 structured fields
+        timestamp=datetime.now(UTC),
+        event_type=action,
+        actor_user_id=user_id,
+        result=AuditResult.success,
+        created_at=datetime.now(UTC),
+    )
     db.add(entry)
     await db.commit()

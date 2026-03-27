@@ -326,12 +326,29 @@ class GroupRole(Base):
     role = relationship("DbRole")
 
 
+class AuditResult(enum.StrEnum):
+    success = "success"
+    failure = "failure"
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id = Column(Integer, Identity(always=True), primary_key=True)
-    user_id = Column(Integer, nullable=False)
-    action = Column(String(100), nullable=False)
+    timestamp = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC), index=True)
+    event_type = Column(String(100), nullable=False, index=True)
+    actor_user_id = Column(Integer, nullable=True)
+    actor_email = Column(String(320), nullable=True)
+    target_type = Column(String(100), nullable=True)
+    target_id = Column(String(255), nullable=True)
+    tenant_id = Column(Integer, nullable=True)
+    details = Column(JSON, nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(String(500), nullable=True)
+    result = Column(Enum(AuditResult), nullable=False, default=AuditResult.success)
+    # Legacy fields kept for backward compat
+    user_id = Column(Integer, nullable=True)
+    action = Column(String(100), nullable=True)
     target = Column(String(255), nullable=True)
     detail = Column(Text, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime, nullable=True, default=lambda: datetime.now(UTC))
