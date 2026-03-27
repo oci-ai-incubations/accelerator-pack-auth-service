@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     local_auth_enabled: bool = True
     oidc_enabled: bool = False
     saml_enabled: bool = False
+    scim_enabled: bool = False
+    scim_token: str = ""  # Hashed SCIM bearer token for provisioning
 
     # First registered user auto-promoted to admin
     auto_admin_first_user: bool = True
