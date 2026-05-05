@@ -19,6 +19,7 @@ from .auth import (
     enforce_session_limit,
     get_current_user,
     hash_password,
+    is_token_blacklisted,
     log_audit,
     record_failed_login,
     require_admin,
@@ -266,6 +267,43 @@ async def revoke_token(
 @app.get("/auth/me", response_model=UserResponse)
 async def get_me(user: User = Depends(get_current_user)):
     return UserResponse.model_validate(user)
+
+
+# ── Token validation for downstream services (e.g. llama-stack CustomAuthProvider) ──
+@app.post("/auth/validate")
+async def validate_token_for_downstream(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    token = payload.get("api_key", "")
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+
+    claims = decode_token(token)
+    if claims.get("type") == "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh tokens cannot authenticate"
+        )
+
+    jti = claims.get("jti")
+    if jti and await is_token_blacklisted(db, jti):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
+
+    user_id = int(claims["sub"])
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive"
+        )
+
+    return {
+        "principal": str(user.id),
+        "attributes": {
+            "roles": [claims.get("role")] if claims.get("role") else [],
+            "email": [user.email],
+        },
+    }
 
 
 # ── User Management (admin only) ─────────────────
