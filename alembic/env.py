@@ -19,7 +19,10 @@ from accelerator_pack_auth_service.models import Base
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False so importing alembic during tests
+    # doesn't silence pre-existing loggers (e.g. pack_models.registry),
+    # which would otherwise break caplog-based assertions later in the run.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
