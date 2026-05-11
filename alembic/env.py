@@ -51,9 +51,18 @@ def _runtime_url_and_connect_args() -> tuple[str, dict]:
     return (settings.database_url, {})
 
 
-# Reflect the runtime URL into the alembic config so log output is accurate.
-_runtime_url, _runtime_connect_args = _runtime_url_and_connect_args()
-config.set_main_option("sqlalchemy.url", _runtime_url)
+# Escape hatch for tests: if the caller has set a non-default URL via
+# cfg.set_main_option("sqlalchemy.url", ...) BEFORE invoking alembic
+# command.upgrade(), honor it. The default value in alembic.ini is treated
+# as "no override" so production behavior remains settings-driven.
+_INI_DEFAULT_URL = "sqlite+aiosqlite:///./auth.db"
+_explicit_url = config.get_main_option("sqlalchemy.url")
+if _explicit_url and _explicit_url != _INI_DEFAULT_URL:
+    _runtime_url = _explicit_url
+    _runtime_connect_args: dict = {}
+else:
+    _runtime_url, _runtime_connect_args = _runtime_url_and_connect_args()
+    config.set_main_option("sqlalchemy.url", _runtime_url)
 
 
 def run_migrations_offline() -> None:
