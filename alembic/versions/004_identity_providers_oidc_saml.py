@@ -33,7 +33,7 @@ def upgrade() -> None:
         ),
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("slug", sa.String(100), unique=True, nullable=False, index=True),
-        sa.Column("config", sa.JSON, nullable=False),
+        sa.Column("config", sa.Text, nullable=False),
         sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.text("1")),
         sa.Column("priority", sa.Integer, nullable=False, server_default=sa.text("0")),
         sa.Column("created_at", sa.DateTime, nullable=False),
@@ -56,7 +56,7 @@ def upgrade() -> None:
         ),
         sa.Column("external_id", sa.String(255), nullable=False),
         sa.Column("email", sa.String(320), nullable=True),
-        sa.Column("raw_claims", sa.JSON, nullable=True),
+        sa.Column("raw_claims", sa.Text, nullable=True),
         sa.Column("last_login_at", sa.DateTime, nullable=True),
         sa.UniqueConstraint("provider_id", "external_id", name="uq_provider_external_id"),
     )
