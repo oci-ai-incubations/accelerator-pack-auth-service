@@ -62,13 +62,17 @@ def _run_alembic_upgrade() -> None:
     from alembic import command
     from alembic.config import Config
 
-    # Resolve alembic.ini relative to the package — works inside the
-    # container (where CWD may differ) and during pytest runs.
-    repo_root = Path(__file__).resolve().parents[2]
+    # Resolve alembic.ini + alembic/ via two candidate roots:
+    #   - Path.cwd(): correct in the container (Dockerfile sets WORKDIR
+    #     and ships alembic.ini + alembic/ there).
+    #   - parents[2] of this module: correct in dev/test source layout
+    #     (src/accelerator_pack_auth_service/ → repo root).
+    # When the package is pip-installed (site-packages), parents[2] resolves
+    # to <python-prefix>/, which lacks alembic/. cwd is the reliable handle.
+    candidates = [Path.cwd(), Path(__file__).resolve().parents[2]]
+    repo_root = next((p for p in candidates if (p / "alembic.ini").exists()), candidates[0])
     ini_path = repo_root / "alembic.ini"
     cfg = Config(str(ini_path))
-    # script_location in alembic.ini is `alembic` (relative). Pin it to the
-    # absolute path so it resolves regardless of cwd.
     cfg.set_main_option("script_location", str(repo_root / "alembic"))
     command.upgrade(cfg, "head")
 
