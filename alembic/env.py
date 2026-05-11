@@ -1,10 +1,20 @@
+"""Alembic environment.
+
+Migrations honor the runtime application config (AUTH_DATABASE_TYPE +
+AUTH_DATABASE_URL / AUTH_ORACLE_* env vars) rather than the static
+sqlalchemy.url in alembic.ini. This keeps the migration target in lock-step
+with what the running app talks to, so a deploy can't end up with an Alembic
+SQLite schema and an Oracle runtime engine.
+"""
+
 import asyncio
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import pool
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.ext.asyncio import create_async_engine
 
+from accelerator_pack_auth_service.config import settings
 from accelerator_pack_auth_service.models import Base
 
 config = context.config
@@ -14,9 +24,41 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def _resolved_db_type() -> str:
+    """Mirror database._build_engine's auto-detect logic."""
+    db_type = settings.database_type
+    if db_type == "auto":
+        if settings.oracle_connection_string:
+            return "oracle"
+        if "postgresql" in settings.database_url:
+            return "postgres"
+        return "sqlite"
+    return db_type
+
+
+def _runtime_url_and_connect_args() -> tuple[str, dict]:
+    """URL + connect_args that match database._build_engine()."""
+    db_type = _resolved_db_type()
+    if db_type == "oracle":
+        return (
+            "oracle+oracledb://",
+            {
+                "user": settings.oracle_user,
+                "password": settings.oracle_password,
+                "dsn": settings.oracle_connection_string,
+            },
+        )
+    return (settings.database_url, {})
+
+
+# Reflect the runtime URL into the alembic config so log output is accurate.
+_runtime_url, _runtime_connect_args = _runtime_url_and_connect_args()
+config.set_main_option("sqlalchemy.url", _runtime_url)
+
+
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
-    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    """Offline mode — emit SQL against the runtime URL."""
+    context.configure(url=_runtime_url, target_metadata=target_metadata, literal_binds=True)
     with context.begin_transaction():
         context.run_migrations()
 
@@ -28,10 +70,11 @@ def do_run_migrations(connection) -> None:
 
 
 async def run_async_migrations() -> None:
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    """Online async mode — build a fresh async engine from runtime settings."""
+    connectable = create_async_engine(
+        _runtime_url,
         poolclass=pool.NullPool,
+        connect_args=_runtime_connect_args,
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

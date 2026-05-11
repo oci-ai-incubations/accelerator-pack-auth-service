@@ -143,3 +143,7 @@ Key settings:
 Supports SQLite (dev), PostgreSQL, Oracle 26ai via `AUTH_DATABASE_URL` / `AUTH_DATABASE_TYPE`.
 
 Alembic migrations: `001` through `006`. Tables: users, collection_permissions, refresh_tokens, token_blacklist, failed_login_attempts, tenants, roles, permissions, role_permissions, user_roles, direct_grants, resource_ownership, identity_providers, external_identities, claim_role_mappings, groups, group_memberships, group_roles, audit_logs.
+
+### Schema bootstrap
+
+At startup the FastAPI lifespan runs **`alembic upgrade head`** (via `database.init_db()`, which dispatches the synchronous alembic command to a worker thread). The previous implementation used `Base.metadata.create_all()`, which is a no-op against pre-existing tables and produced silent schema drift on upgrades — concretely, an old image without `sa.Identity` left Oracle USERS without an identity column, then a new image with `sa.Identity` in the models failed registrations with `ORA-01400: cannot insert NULL into USERS.ID`. Alembic now runs against the **runtime** database (Oracle / Postgres / SQLite — whatever `database._build_engine()` would pick) because `alembic/env.py` reads `AUTH_DATABASE_TYPE` + `AUTH_DATABASE_URL` / `AUTH_ORACLE_*` from `settings`. The `sqlalchemy.url` in `alembic.ini` is therefore ignored at runtime; it remains in the file only for offline-mode CLI invocations.
