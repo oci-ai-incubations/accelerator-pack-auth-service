@@ -46,6 +46,7 @@ Key settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `AUTH_PACK` | `base` | Active pack auth model (see Pack-extensible RBAC below). Known: `base`, `cuopt`, `paas_rag`, `vss`, `warehouse_pick_path`, `dox_pack`. |
 | `AUTH_DATABASE_URL` | `sqlite+aiosqlite:///./auth.db` | Database URL |
 | `AUTH_JWT_SECRET` | `change-me-in-production` | JWT signing secret |
 | `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | Access token TTL |
@@ -147,3 +148,44 @@ Alembic migrations: `001` through `006`. Tables: users, collection_permissions, 
 ### Schema bootstrap
 
 At startup the FastAPI lifespan runs **`alembic upgrade head`** (via `database.init_db()`, which dispatches the synchronous alembic command to a worker thread). The previous implementation used `Base.metadata.create_all()`, which is a no-op against pre-existing tables and produced silent schema drift on upgrades — concretely, an old image without `sa.Identity` left Oracle USERS without an identity column, then a new image with `sa.Identity` in the models failed registrations with `ORA-01400: cannot insert NULL into USERS.ID`. Alembic now runs against the **runtime** database (Oracle / Postgres / SQLite — whatever `database._build_engine()` would pick) because `alembic/env.py` reads `AUTH_DATABASE_TYPE` + `AUTH_DATABASE_URL` / `AUTH_ORACLE_*` from `settings`. The `sqlalchemy.url` in `alembic.ini` is therefore ignored at runtime; it remains in the file only for offline-mode CLI invocations.
+
+## Pack-extensible RBAC
+
+Each accelerator pack ships its own `PackAuthModel` in `src/accelerator_pack_auth_service/pack_models/<pack>.py`. The active model — selected by `AUTH_PACK` env var — supplies the roles + permissions seeded on first deploy. Runtime CRUD via `/auth/roles` and `/auth/permissions` keeps working on top.
+
+Active model contract (see `pack_models/base.py`):
+
+```python
+class PackAuthModel(BaseModel):
+    pack_id: str
+    roles: list[str]
+    permissions: list[str]
+    role_permissions: dict[str, list[str]]  # role → list of perm keys OR ["*"]
+```
+
+Built-in models:
+
+| AUTH_PACK | Roles | Notes |
+|-----------|-------|-------|
+| `base` (default) | admin, user | Minimal — admin + user only, two perms (admin.users.manage, admin.audit.view) |
+| `cuopt` | admin, user, reader | VRP-shaped perms (cuopt.solve, cuopt.view, chat.use, weather.view, config.read, admin.*) |
+| `paas_rag` | admin, user, reader, pending | Historical collection-based RBAC (collections:read/write/manage/delete, etc.) |
+| `vss`, `warehouse_pick_path`, `dox_pack` | admin, user | Stubs — fill in pack-specific perms later |
+
+**Adding a new pack:**
+
+1. Create `pack_models/<pack>.py` exporting `<PACK>_MODEL: PackAuthModel`.
+2. Register it in `pack_models/registry.py:PACK_MODELS`.
+3. Add tests in `tests/test_pack_models.py` (validity) and optionally `tests/test_pack_seeding.py`.
+4. Deploy with `AUTH_PACK=<pack>`.
+
+**Behavior change vs. pre-pack-model deploys (paas_rag):**
+
+Existing paas_rag deploys MUST set `AUTH_PACK=paas_rag` after upgrading past this change. Without it, `AUTH_PACK` defaults to `base` and only `admin` + `user` roles are seeded — the `reader` + `pending` roles and the collection-based permissions disappear. The TF blueprint in `ai-accelerator-starter-packs` should plumb this from `var.starter_pack_category` into the auth-service recipe's `recipe_container_env`.
+
+**Public endpoint** `GET /auth/pack/model` returns the active model — frontends call it to render only the admin tabs relevant to the deployment.
+
+**Two permission dependencies** in `auth.py`:
+
+- `require_permission(codename)` — full RBAC check via DB (role permissions, direct grants, resource ownership). Use for resource- or grant-scoped checks.
+- `require_pack_permission(codename)` — static check against the active pack model's role→perm map. Faster, no DB. Use for pack-static permissions. Admin bypass matches legacy behavior.

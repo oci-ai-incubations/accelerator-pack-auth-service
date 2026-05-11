@@ -1,14 +1,9 @@
 import asyncio
 import os
 
-import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from accelerator_pack_auth_service.models import Base
-
-# Use in-memory SQLite for tests
+# Use in-memory SQLite for tests. Env vars must be set BEFORE any
+# accelerator_pack_auth_service.* module is imported below, because the
+# settings singleton is built on first import.
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
 os.environ["AUTH_DATABASE_URL"] = TEST_DB_URL
@@ -21,6 +16,16 @@ os.environ["AUTH_MAX_CONCURRENT_SESSIONS"] = "5"
 os.environ["AUTH_SCIM_ENABLED"] = "true"
 # SHA256 hash of "test-scim-token"
 os.environ["AUTH_SCIM_TOKEN"] = "96d72274517e0d926344cee50c7da354c52ccf06fb22fc45a34958db62a84d4f"
+# Default test pack: paas_rag-style RBAC (collections-based perms). Individual
+# tests can monkeypatch settings.pack for pack-specific scenarios.
+os.environ["AUTH_PACK"] = "paas_rag"
+
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+
+from accelerator_pack_auth_service.models import Base  # noqa: E402
 
 
 @pytest.fixture(scope="session")

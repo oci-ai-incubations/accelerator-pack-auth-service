@@ -70,6 +70,14 @@ class Settings(BaseSettings):
     # First registered user auto-promoted to admin
     auto_admin_first_user: bool = True
 
+    # Pack-extensible RBAC: selects which PackAuthModel seeds the DB on first
+    # deploy and gates runtime require_pack_permission checks. See
+    # pack_models/registry.py for known packs. Default "base" = admin + user
+    # only (no pack-specific perms); existing paas_rag deploys MUST set
+    # AUTH_PACK=paas_rag after upgrading past this change.
+    # Field is `pack` so the env_prefix yields `AUTH_PACK`.
+    pack: str = "base"
+
     model_config = {"env_prefix": "AUTH_"}
 
     def model_post_init(self, __context):

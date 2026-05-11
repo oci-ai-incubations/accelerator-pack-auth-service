@@ -2,6 +2,9 @@
 
 Checks permissions via: role-based permissions → direct grants → resource ownership.
 Falls back to legacy User.role enum for backward compatibility.
+
+Seeding is driven by the active `PackAuthModel` (selected by AUTH_PACK env var).
+See `pack_models/` for the per-pack RBAC definitions.
 """
 
 from datetime import UTC, datetime
@@ -9,6 +12,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .config import settings
 from .models import (
     DbRole,
     DirectGrant,
@@ -19,56 +23,92 @@ from .models import (
     User,
     UserRole,
 )
+from .pack_models import PackAuthModel, load_active_model
 
-# System permissions seeded on startup
-SYSTEM_PERMISSIONS = [
-    ("users:list", "List all users", "users"),
-    ("users:read", "Read user details", "users"),
-    ("users:update", "Update user details", "users"),
-    ("users:delete", "Deactivate a user", "users"),
-    ("collections:read", "Read collections", "collections"),
-    ("collections:write", "Upload to collections", "collections"),
-    ("collections:manage", "Manage collection permissions", "collections"),
-    ("collections:delete", "Delete collections", "collections"),
-    ("roles:list", "List roles", "roles"),
-    ("roles:create", "Create roles", "roles"),
-    ("roles:read", "Read role details", "roles"),
-    ("roles:update", "Update roles", "roles"),
-    ("roles:delete", "Delete roles", "roles"),
-    ("permissions:list", "List all permissions", "permissions"),
-    ("permissions:check", "Check permission for a user", "permissions"),
-]
+# Human-readable descriptions for known permission keys. Permissions seeded
+# from a pack model that aren't in this map get an auto-generated description.
+PERMISSION_DESCRIPTIONS: dict[str, tuple[str, str]] = {
+    # paas_rag legacy
+    "users:list": ("List all users", "users"),
+    "users:read": ("Read user details", "users"),
+    "users:update": ("Update user details", "users"),
+    "users:delete": ("Deactivate a user", "users"),
+    "collections:read": ("Read collections", "collections"),
+    "collections:write": ("Upload to collections", "collections"),
+    "collections:manage": ("Manage collection permissions", "collections"),
+    "collections:delete": ("Delete collections", "collections"),
+    "roles:list": ("List roles", "roles"),
+    "roles:create": ("Create roles", "roles"),
+    "roles:read": ("Read role details", "roles"),
+    "roles:update": ("Update roles", "roles"),
+    "roles:delete": ("Delete roles", "roles"),
+    "permissions:list": ("List all permissions", "permissions"),
+    "permissions:check": ("Check permission for a user", "permissions"),
+    # cuopt
+    "cuopt.solve": ("Submit a routing solve request", "cuopt"),
+    "cuopt.view": ("View routing solutions", "cuopt"),
+    "chat.use": ("Use the GenAI chat assistant", "chat"),
+    "weather.view": ("View weather data for routes", "weather"),
+    "config.read": ("Read runtime configuration", "config"),
+    # cross-pack admin
+    "admin.users.manage": ("Manage users", "admin"),
+    "admin.config.write": ("Write runtime configuration / API keys", "admin"),
+    "admin.features.toggle": ("Enable/disable optional features", "admin"),
+    "admin.audit.view": ("View the audit log", "admin"),
+}
 
-# System roles and their default permissions
-SYSTEM_ROLES = {
-    "admin": {
-        "description": "Full access to all resources",
-        "permissions": "*",  # all permissions
-    },
-    "user": {
-        "description": "Standard user with read/write access to assigned collections",
-        "permissions": ["collections:read", "collections:write"],
-    },
-    "reader": {
-        "description": "Read-only access to assigned collections",
-        "permissions": ["collections:read"],
-    },
-    "pending": {
-        "description": "Awaiting admin approval — no access",
-        "permissions": [],
-    },
+# Role descriptions for known roles. Roles outside this map get a generic
+# auto-generated description at seed time.
+ROLE_DESCRIPTIONS: dict[str, str] = {
+    "admin": "Full access to all resources",
+    "user": "Standard user",
+    "reader": "Read-only access",
+    "pending": "Awaiting admin approval — no access",
 }
 
 
-async def seed_roles_and_permissions(db: AsyncSession) -> None:
-    """Seed system permissions and roles if they don't exist."""
+def _permission_meta(codename: str) -> tuple[str, str]:
+    """Return (description, resource_type) for a permission key.
+
+    Falls back to a generic description + the prefix-before-colon-or-dot as
+    the resource type if the key is not in PERMISSION_DESCRIPTIONS.
+    """
+    if codename in PERMISSION_DESCRIPTIONS:
+        return PERMISSION_DESCRIPTIONS[codename]
+    if ":" in codename:
+        resource_type = codename.split(":", 1)[0]
+    elif "." in codename:
+        resource_type = codename.split(".", 1)[0]
+    else:
+        resource_type = codename
+    return (f"Permission {codename}", resource_type)
+
+
+def _role_description(role_name: str) -> str:
+    return ROLE_DESCRIPTIONS.get(role_name, f"Role {role_name}")
+
+
+async def seed_roles_and_permissions(
+    db: AsyncSession,
+    model: PackAuthModel | None = None,
+) -> None:
+    """Seed permissions and roles defined by the active pack model.
+
+    Idempotent — existing permissions/roles are not duplicated. Runtime CRUD
+    via the /auth/roles and /auth/permissions endpoints continues to work on
+    top of the seeded baseline.
+    """
+    pack_model = model if model is not None else load_active_model(settings.pack)
+
     # Seed permissions
-    for codename, description, resource_type in SYSTEM_PERMISSIONS:
+    for codename in pack_model.permissions:
         existing = await db.execute(select(Permission).where(Permission.codename == codename))
-        if not existing.scalar_one_or_none():
-            db.add(
-                Permission(codename=codename, description=description, resource_type=resource_type)
-            )
+        if existing.scalar_one_or_none():
+            continue
+        description, resource_type = _permission_meta(codename)
+        db.add(
+            Permission(codename=codename, description=description, resource_type=resource_type)
+        )
     await db.commit()
 
     # Load all permissions for role assignment
@@ -76,7 +116,7 @@ async def seed_roles_and_permissions(db: AsyncSession) -> None:
     all_perms = {p.codename: p for p in result.scalars().all()}
 
     # Seed roles
-    for role_name, role_def in SYSTEM_ROLES.items():
+    for role_name in pack_model.roles:
         existing = await db.execute(
             select(DbRole).where(DbRole.name == role_name, DbRole.is_system == 1)
         )
@@ -84,7 +124,7 @@ async def seed_roles_and_permissions(db: AsyncSession) -> None:
         if not role:
             role = DbRole(
                 name=role_name,
-                description=role_def["description"],
+                description=_role_description(role_name),
                 is_system=True,
                 is_default=(role_name == "pending"),
                 created_at=datetime.now(UTC),
@@ -94,9 +134,7 @@ async def seed_roles_and_permissions(db: AsyncSession) -> None:
             await db.refresh(role)
 
         # Assign permissions to role
-        perm_codes = role_def["permissions"]
-        if perm_codes == "*":
-            perm_codes = list(all_perms.keys())
+        perm_codes = pack_model.permissions_for_role(role_name)
 
         for codename in perm_codes:
             perm = all_perms.get(codename)

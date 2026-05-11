@@ -138,6 +138,19 @@ async def alive():
     return {"status": "alive"}
 
 
+@app.get("/auth/pack/model")
+async def get_pack_model() -> dict:
+    """Return the active pack auth model.
+
+    Public — no auth required. Frontends call this to discover which roles +
+    permissions the deployment supports so admin UIs can render only the
+    relevant tabs.
+    """
+    from .pack_models import load_active_model
+
+    return load_active_model(settings.pack).model_dump()
+
+
 # ── Registration & Login ──────────────────────────
 
 

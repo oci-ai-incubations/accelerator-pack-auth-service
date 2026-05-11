@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import settings
 from .database import get_db
 from .models import FailedLoginAttempt, RefreshToken, Role, TokenBlacklist, User
+from .pack_models import load_active_model
 
 security = HTTPBearer()
 
@@ -133,7 +134,12 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
 
 
 def require_permission(permission_codename: str):
-    """Factory that returns a FastAPI dependency checking a specific permission."""
+    """Factory: dependency that checks a permission via the full RBAC engine.
+
+    Consults role-based permissions, direct grants, and resource ownership
+    (see permission_service.check_permission). Use this for permissions tied
+    to specific resources or grant-based access.
+    """
 
     async def _check(
         user: User = Depends(get_current_user),
@@ -143,6 +149,33 @@ def require_permission(permission_codename: str):
 
         has_perm = await check_permission(db, user, permission_codename)
         if not has_perm:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Missing required permission: {permission_codename}",
+            )
+        return user
+
+    return _check
+
+
+def require_pack_permission(permission_codename: str):
+    """Factory: dependency that checks a permission against the active pack model.
+
+    Faster than `require_permission` because it does not query the DB —
+    resolves the user's role to the static role→permission map declared by
+    the active PackAuthModel (selected by AUTH_PACK). Use for pack-static
+    permission checks; use `require_permission` for resource- or grant-scoped
+    checks.
+
+    `admin` role always passes (matches legacy behavior).
+    """
+
+    async def _check(user: User = Depends(get_current_user)) -> User:
+        if user.role == Role.admin:
+            return user
+        pack_model = load_active_model(settings.pack)
+        effective_perms = pack_model.permissions_for_role(user.role.value)
+        if permission_codename not in effective_perms:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Missing required permission: {permission_codename}",
