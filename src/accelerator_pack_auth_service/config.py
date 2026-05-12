@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     oracle_password: str = ""
 
     # JWT
-    jwt_secret: str = "change-me-in-production"
+    jwt_secret: str = "change-me-in-production"  # noqa: S105 — sentinel default; production overrides via AUTH_JWT_SECRET
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7

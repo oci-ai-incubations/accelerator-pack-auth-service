@@ -59,7 +59,7 @@ async def jit_provision_user(
         user = User(
             email=email,
             name=name,
-            password_hash="!sso-only",  # Cannot login with password
+            password_hash="!sso-only",  # noqa: S106 — sentinel that fails bcrypt.verify; SSO-provisioned users have no password path
             role=Role.user,  # SSO users get 'user' role by default
         )
         db.add(user)

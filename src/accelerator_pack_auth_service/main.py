@@ -22,6 +22,7 @@ from .auth import (
     log_audit,
     record_failed_login,
     require_admin,
+    require_pack_permission,
     require_permission,
     revoke_user_tokens,
     store_refresh_token,
@@ -97,13 +98,20 @@ app.add_middleware(
 )
 
 
-# Security headers middleware
+# Security headers middleware. Permissions-Policy denies camera/mic/geolocation
+# (auth-service doesn't need them). CSP for the JSON API surface: no scripts,
+# no inline content, framing denied — the admin UI is on a separate origin
+# (the pack frontend) so this host serves only API responses.
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response: Response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+    )
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
@@ -1348,7 +1356,7 @@ async def scim_delete_group(
 @app.get("/auth/audit")
 async def query_audit(
     request: Request,
-    _admin: User = Depends(require_admin),
+    _user: User = Depends(require_pack_permission("admin.audit.view")),
     db: AsyncSession = Depends(get_db),
 ):
     from .audit_service import audit_log_to_dict, query_audit_logs
@@ -1374,7 +1382,7 @@ async def query_audit(
 
 @app.get("/auth/audit/export")
 async def export_audit(
-    _admin: User = Depends(require_admin),
+    _user: User = Depends(require_pack_permission("admin.audit.view")),
     db: AsyncSession = Depends(get_db),
 ):
     """Export all audit logs as JSON array (for streaming, use NDJSON in production)."""

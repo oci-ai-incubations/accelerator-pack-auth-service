@@ -133,7 +133,7 @@ async def scim_create_user(db: AsyncSession, data: dict) -> User:
     user = User(
         email=email,
         name=name,
-        password_hash="!scim-provisioned",
+        password_hash="!scim-provisioned",  # noqa: S106 — sentinel that fails bcrypt.verify; SCIM-provisioned users sign in via SSO only
         role=Role.user,
         is_active=data.get("active", True),
     )

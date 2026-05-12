@@ -106,9 +106,7 @@ async def seed_roles_and_permissions(
         if existing.scalar_one_or_none():
             continue
         description, resource_type = _permission_meta(codename)
-        db.add(
-            Permission(codename=codename, description=description, resource_type=resource_type)
-        )
+        db.add(Permission(codename=codename, description=description, resource_type=resource_type))
     await db.commit()
 
     # Load all permissions for role assignment

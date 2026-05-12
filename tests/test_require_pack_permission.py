@@ -1,6 +1,5 @@
 """Tests for require_pack_permission factory."""
 
-
 import pytest
 from fastapi import HTTPException
 
