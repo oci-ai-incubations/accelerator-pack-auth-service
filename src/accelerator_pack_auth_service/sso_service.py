@@ -214,7 +214,7 @@ async def issue_sso_tokens(
     user: User,
 ) -> tuple[str, str]:
     """Issue internal JWT tokens after SSO authentication."""
-    access_token = create_access_token(user)
+    access_token = await create_access_token(db, user)
     refresh_value = create_refresh_token_value()
     await store_refresh_token(db, user.id, refresh_value)
     return access_token, refresh_value

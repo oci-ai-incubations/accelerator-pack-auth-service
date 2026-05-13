@@ -344,6 +344,31 @@ class GroupRole(Base):
     role = relationship("DbRole")
 
 
+class SigningKeyStatus(enum.StrEnum):
+    active = "active"
+    rotating_out = "rotating_out"
+    revoked = "revoked"
+
+
+class SigningKey(Base):
+    __tablename__ = "signing_keys"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    kid = Column(String(64), nullable=False, unique=True, index=True)
+    algorithm = Column(String(16), nullable=False, default="RS256")
+    public_pem = Column(Text, nullable=False)
+    private_pem = Column(Text, nullable=False)
+    status = Column(
+        Enum(SigningKeyStatus),
+        nullable=False,
+        default=SigningKeyStatus.active,
+        index=True,
+    )
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    rotated_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+
+
 class AuditResult(enum.StrEnum):
     success = "success"
     failure = "failure"

@@ -63,7 +63,7 @@ def test_alembic_upgrade_idempotent_on_second_run(tmp_path: Path) -> None:
     command.upgrade(cfg, "head")
 
 
-@pytest.mark.parametrize("revision", ["001", "002", "003", "004", "005", "006"])
+@pytest.mark.parametrize("revision", ["001", "002", "003", "004", "005", "006", "007"])
 def test_alembic_step_upgrades(tmp_path: Path, revision: str) -> None:
     """Each intermediate revision can be reached without error."""
     db_file = tmp_path / f"alembic_step_{revision}.db"

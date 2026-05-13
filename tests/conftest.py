@@ -1,4 +1,3 @@
-import asyncio
 import os
 
 # Use in-memory SQLite for tests. Env vars must be set BEFORE any
@@ -7,7 +6,7 @@ import os
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
 os.environ["AUTH_DATABASE_URL"] = TEST_DB_URL
-os.environ["AUTH_JWT_SECRET"] = "test-secret"
+os.environ["AUTH_ISSUER_URL"] = "https://auth-service.test"
 os.environ["AUTH_RATE_LIMIT_LOGIN"] = "1000/minute"
 os.environ["AUTH_RATE_LIMIT_REGISTER"] = "1000/minute"
 os.environ["AUTH_ACCOUNT_LOCKOUT_THRESHOLD"] = "3"
@@ -20,7 +19,6 @@ os.environ["AUTH_SCIM_TOKEN"] = "96d72274517e0d926344cee50c7da354c52ccf06fb22fc4
 # tests can monkeypatch settings.pack for pack-specific scenarios.
 os.environ["AUTH_PACK"] = "paas_rag"
 
-import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
@@ -30,13 +28,6 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
 )
 
 from accelerator_pack_auth_service.models import Base  # noqa: E402
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest_asyncio.fixture

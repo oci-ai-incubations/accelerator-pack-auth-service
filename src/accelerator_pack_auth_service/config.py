@@ -37,9 +37,12 @@ class Settings(BaseSettings):
     oracle_user: str = ""
     oracle_password: str = ""
 
-    # JWT
-    jwt_secret: str = "change-me-in-production"  # noqa: S105 — sentinel default; production overrides via AUTH_JWT_SECRET
-    jwt_algorithm: str = "HS256"
+    # JWT (RS256 only — signing keys live in the signing_keys table).
+    # issuer_url is the public origin of this auth-service (e.g.
+    # https://pack.example.com/auth); it goes into every token's `iss` claim
+    # and the OIDC discovery doc. Required when token issuance is enabled
+    # (local_auth_enabled or oidc_enabled); validated in `model_post_init`.
+    issuer_url: str = ""
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
 
@@ -81,13 +84,15 @@ class Settings(BaseSettings):
     model_config = {"env_prefix": "AUTH_"}
 
     def model_post_init(self, __context):
-        """Apply profile presets if profile is not 'custom'."""
+        """Apply profile presets and validate issuer configuration."""
         if self.profile in PROFILE_PRESETS:
             preset = PROFILE_PRESETS[self.profile]
             for key, value in preset.items():
                 # Only apply preset if env var wasn't explicitly set
                 if key not in (self.model_fields_set or set()):
                     object.__setattr__(self, key, value)
+        if not self.issuer_url and (self.local_auth_enabled or self.oidc_enabled):
+            raise ValueError("AUTH_ISSUER_URL must be set when token issuance is enabled.")
 
 
 settings = Settings()

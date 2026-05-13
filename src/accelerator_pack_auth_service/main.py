@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +32,12 @@ from .auth import (
     verify_password,
 )
 from .config import settings
+from .crypto import (
+    jwks_entry_for_key,
+    list_keys_for_jwks,
+    revoke_key,
+    rotate_active_key,
+)
 from .database import get_db, init_db
 from .models import (
     ClaimRoleMapping,
@@ -40,6 +47,7 @@ from .models import (
     Permission,
     Role,
     RolePermission,
+    SigningKey,
     User,
     UserRole,
 )
@@ -76,12 +84,15 @@ limiter = Limiter(key_func=get_remote_address)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await init_db()
-    # Seed system roles and permissions
+    # Seed system roles and permissions, and ensure an active signing key
+    # exists so the JWKS endpoint is non-empty before the first registration.
+    from .crypto import get_active_signing_key
     from .database import async_session
     from .permission_service import seed_roles_and_permissions
 
-    async with async_session() as db:
-        await seed_roles_and_permissions(db)
+    async with async_session() as session:
+        await seed_roles_and_permissions(session)
+        await get_active_signing_key(session)
     yield
 
 
@@ -113,6 +124,14 @@ OPENAPI_TAGS = [
     {"name": "SCIM", "description": "SCIM 2.0 user/group provisioning (bearer-token gated)."},
     {"name": "Audit", "description": "Audit log query, export, and retention purge."},
     {"name": "Admin", "description": "Admin dashboard status + feature flags."},
+    {
+        "name": "Discovery",
+        "description": "Public OIDC discovery + JWKS endpoints for token verifiers.",
+    },
+    {
+        "name": "Signing Keys",
+        "description": "RS256 signing-key lifecycle: list, rotate, revoke (admin).",
+    },
 ]
 
 
@@ -293,6 +312,61 @@ async def get_pack_model() -> dict:
     return load_active_model(settings.pack).model_dump()
 
 
+# ── OIDC Discovery & JWKS ────────────────────────
+
+
+@app.get(
+    "/.well-known/jwks.json",
+    summary="JSON Web Key Set",
+    description=(
+        "RFC 7517 JWKS document. Returns every signing key that is either "
+        "active or within its 24h rotating_out grace window — revoked keys "
+        "are excluded immediately. Pack backends fetch this URL, cache it "
+        "for `AUTH_JWKS_CACHE_TTL`, and verify token signatures locally."
+    ),
+    tags=["Discovery"],
+    responses={200: {"description": "JWKS document"}},
+    openapi_extra={"security": []},
+)
+async def get_jwks(response: Response, db: AsyncSession = Depends(get_db)) -> dict:
+    keys = await list_keys_for_jwks(db)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return {"keys": [jwks_entry_for_key(k) for k in keys]}
+
+
+@app.get(
+    "/.well-known/openid-configuration",
+    summary="OIDC discovery document",
+    description=(
+        "RFC 8414 OIDC discovery doc. Lets external verifiers auto-discover "
+        "the JWKS URL, token/userinfo endpoints, and supported signing "
+        "algorithms without out-of-band configuration."
+    ),
+    tags=["Discovery"],
+    responses={
+        200: {"description": "Discovery document"},
+        503: {"description": "OIDC discovery not configured (AUTH_ISSUER_URL unset)"},
+    },
+    openapi_extra={"security": []},
+)
+async def get_oidc_discovery() -> dict:
+    issuer = settings.issuer_url
+    if not issuer:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OIDC discovery not configured",
+        )
+    return {
+        "issuer": issuer,
+        "jwks_uri": f"{issuer}/.well-known/jwks.json",
+        "token_endpoint": f"{issuer}/auth/login",
+        "userinfo_endpoint": f"{issuer}/auth/me",
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "response_types_supported": ["token"],
+        "subject_types_supported": ["public"],
+    }
+
+
 # ── Registration & Login ──────────────────────────
 
 
@@ -339,7 +413,7 @@ async def register(request: Request, req: RegisterRequest, db: AsyncSession = De
     await db.refresh(user)
 
     await enforce_session_limit(db, user.id)
-    access_token = create_access_token(user)
+    access_token = await create_access_token(db, user)
     refresh_value = create_refresh_token_value()
     await store_refresh_token(db, user.id, refresh_value)
 
@@ -389,7 +463,7 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
     await clear_failed_attempts(db, req.email)
     await enforce_session_limit(db, user.id)
 
-    access_token = create_access_token(user)
+    access_token = await create_access_token(db, user)
     refresh_value = create_refresh_token_value()
     await store_refresh_token(db, user.id, refresh_value)
 
@@ -433,7 +507,7 @@ async def refresh_token(req: RefreshRequest, db: AsyncSession = Depends(get_db))
         )
 
     # Issue new token pair
-    new_access = create_access_token(user)
+    new_access = await create_access_token(db, user)
     new_refresh = create_refresh_token_value()
     await store_refresh_token(db, user.id, new_refresh)
 
@@ -463,7 +537,7 @@ async def logout(
     # Blacklist the current access token
     token = request.headers.get("authorization", "").removeprefix("Bearer ")
     if token:
-        payload = decode_token(token)
+        payload = await decode_token(db, token)
         jti = payload.get("jti")
         if jti:
             exp = datetime.fromtimestamp(payload["exp"], tz=UTC)
@@ -495,7 +569,7 @@ async def revoke_token(
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    payload = decode_token(req.token)
+    payload = await decode_token(db, req.token)
     jti = payload.get("jti")
     if not jti:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token has no JTI")
@@ -2375,6 +2449,98 @@ async def admin_status(
             "groups": group_count,
         },
     }
+
+
+# ── Signing Keys (admin) ─────────────────────────
+
+
+def _signing_key_to_dict(key: SigningKey) -> dict[str, Any]:
+    return {
+        "id": key.id,
+        "kid": key.kid,
+        "algorithm": key.algorithm,
+        "status": str(key.status),
+        "created_at": key.created_at.isoformat() if key.created_at else None,
+        "rotated_at": key.rotated_at.isoformat() if key.rotated_at else None,
+        "revoked_at": key.revoked_at.isoformat() if key.revoked_at else None,
+    }
+
+
+@app.get(
+    "/auth/admin/signing-keys",
+    summary="List signing keys",
+    description=(
+        "Return every signing key with its kid, algorithm, status, and lifecycle "
+        "timestamps. Private key material is never returned. Admin only."
+    ),
+    tags=["Signing Keys"],
+    responses={
+        200: {"description": "List of signing keys"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
+async def list_signing_keys(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    result = await db.execute(select(SigningKey).order_by(SigningKey.created_at.desc()))
+    return [_signing_key_to_dict(k) for k in result.scalars().all()]
+
+
+@app.post(
+    "/auth/admin/signing-keys/rotate",
+    summary="Rotate the active signing key",
+    description=(
+        "Mint a new RS256 keypair, mark the current active key as "
+        "`rotating_out` (kept in the JWKS for a 24h grace window so in-flight "
+        "tokens stay verifiable), and start signing new tokens with the new "
+        "key. Audit-logged. Admin only."
+    ),
+    tags=["Signing Keys"],
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        201: {"description": "New active key minted"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
+async def rotate_signing_key(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    new_key = await rotate_active_key(db)
+    await log_audit(db, admin.id, "rotate_signing_key", f"kid={new_key.kid}")
+    return _signing_key_to_dict(new_key)
+
+
+@app.delete(
+    "/auth/admin/signing-keys/{kid}",
+    summary="Revoke a signing key",
+    description=(
+        "Mark the signing key with the given `kid` as `revoked`. Tokens "
+        "signed with that kid stop validating immediately and the key is "
+        "removed from the public JWKS on the next fetch. Audit-logged. "
+        "Admin only."
+    ),
+    tags=["Signing Keys"],
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        204: {"description": "Key revoked"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Signing key not found"},
+    },
+)
+async def delete_signing_key(
+    kid: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    revoked = await revoke_key(db, kid)
+    if revoked is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Signing key not found")
+    await log_audit(db, admin.id, "revoke_signing_key", f"kid={kid}")
 
 
 if __name__ == "__main__":

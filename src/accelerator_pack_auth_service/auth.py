@@ -10,9 +10,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import crypto
 from .config import settings
+from .crypto import get_active_signing_key, get_key_by_kid
 from .database import get_db
-from .models import FailedLoginAttempt, RefreshToken, Role, TokenBlacklist, User
+from .models import FailedLoginAttempt, RefreshToken, Role, SigningKeyStatus, TokenBlacklist, User
 from .pack_models import load_active_model
 
 security = HTTPBearer()
@@ -27,7 +29,15 @@ def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode(), password_hash.encode())
 
 
-def create_access_token(user: User) -> str:
+async def create_access_token(db: AsyncSession, user: User) -> str:
+    """Mint an RS256 access token signed by the current active signing key.
+
+    Takes ``db`` so the caller's session — the same one FastAPI's
+    ``get_db`` dependency yields — drives the signing-key lookup. Opening a
+    fresh ``async_session()`` here would bypass the test fixture override
+    and read a different engine that has no signing keys.
+    """
+    signing_key = await get_active_signing_key(db)
     payload = {
         "sub": str(user.id),
         "email": user.email,
@@ -35,10 +45,17 @@ def create_access_token(user: User) -> str:
         "name": user.name,
         "type": "access",
         "jti": str(uuid.uuid4()),
+        "iss": settings.issuer_url,
+        "aud": [settings.pack],
         "exp": datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes),
         "iat": datetime.now(UTC),
     }
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    return jwt.encode(
+        payload,
+        signing_key.private_pem,
+        algorithm="RS256",
+        headers={"kid": signing_key.kid},
+    )
 
 
 def create_refresh_token_value() -> str:
@@ -80,9 +97,49 @@ async def revoke_user_tokens(db: AsyncSession, user_id: int) -> None:
     await db.commit()
 
 
-def decode_token(token: str) -> dict:
+async def decode_token(db: AsyncSession, token: str) -> dict:
+    """Verify an RS256 token by resolving its ``kid`` against signing_keys.
+
+    Unknown or revoked kids are rejected before signature verification so a
+    revoked key can't validate one more token. ``rotating_out`` keys are
+    accepted only inside the 24h grace window — past the cutoff their tokens
+    fail the same way revoked-key tokens do. Issuer is always verified
+    (``settings.issuer_url`` is required at startup; see ``Settings.model_post_init``).
+    """
     try:
-        return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        unverified_header = jwt.get_unverified_header(token)
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from e
+
+    kid = unverified_header.get("kid")
+    if not kid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing kid header"
+        )
+
+    signing_key = await get_key_by_kid(db, kid)
+    if signing_key is None or signing_key.status == SigningKeyStatus.revoked:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown or revoked signing key"
+        )
+    if signing_key.status == SigningKeyStatus.rotating_out:
+        rotated_at = signing_key.rotated_at
+        if rotated_at is not None and rotated_at.tzinfo is None:
+            rotated_at = rotated_at.replace(tzinfo=UTC)
+        if rotated_at is None or rotated_at + crypto.ROTATING_OUT_GRACE <= datetime.now(UTC):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token",
+            )
+
+    try:
+        return jwt.decode(
+            token,
+            signing_key.public_pem,
+            algorithms=["RS256"],
+            issuer=settings.issuer_url,
+            options={"verify_iss": True, "verify_aud": False},
+        )
     except jwt.ExpiredSignatureError as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired") from e
     except jwt.InvalidTokenError as e:
@@ -104,7 +161,7 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    payload = decode_token(credentials.credentials)
+    payload = await decode_token(db, credentials.credentials)
     if payload.get("type") == "refresh":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
