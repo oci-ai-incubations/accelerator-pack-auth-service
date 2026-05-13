@@ -3,12 +3,13 @@ from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import scim_service
+from . import __version__, scim_service
 from .auth import (
     blacklist_token,
     check_account_lockout,
@@ -84,8 +85,106 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="aRBi Auth Service", version="1.0.0", lifespan=lifespan)
+OPENAPI_TAGS = [
+    {"name": "Health", "description": "Liveness, readiness, and pack-model discovery."},
+    {
+        "name": "Authentication",
+        "description": "Login, registration, refresh, logout, and token revocation.",
+    },
+    {"name": "Current User", "description": "Profile of the authenticated user."},
+    {"name": "Users", "description": "User management (admin only)."},
+    {
+        "name": "Collections",
+        "description": "Per-collection permission grants (legacy paas_rag model).",
+    },
+    {"name": "Roles", "description": "RBAC role CRUD and permission assignments (admin)."},
+    {"name": "Permissions", "description": "Permission catalog and per-user checks (admin)."},
+    {"name": "User Roles", "description": "Assign or revoke roles on a user (admin)."},
+    {
+        "name": "Identity Providers",
+        "description": "OIDC/SAML provider configuration (admin).",
+    },
+    {"name": "Claim Mappings", "description": "Map IdP claims to internal roles (admin)."},
+    {
+        "name": "SSO",
+        "description": "Public discovery, IdP authorize URL build, and code/token exchange.",
+    },
+    {"name": "Groups", "description": "Group CRUD, membership, and group→role binding (admin)."},
+    {"name": "SCIM", "description": "SCIM 2.0 user/group provisioning (bearer-token gated)."},
+    {"name": "Audit", "description": "Audit log query, export, and retention purge."},
+    {"name": "Admin", "description": "Admin dashboard status + feature flags."},
+]
+
+
+app = FastAPI(
+    title="OCI AI Accelerator Auth Service",
+    version=__version__,
+    description=(
+        "Pluggable per-user JWT authentication, RBAC, OIDC/SAML SSO, SCIM 2.0 "
+        "provisioning, and audit logging for OCI AI Accelerator packs. Customers "
+        "integrate by fetching this OpenAPI document, generating a typed client, "
+        "and calling `/auth/*` from their applications."
+    ),
+    # Unconditionally exposed (no DEBUG gate): auth-service has no ingress —
+    # only the pack frontend's /auth/* prefix routes to it, and /docs etc. fall
+    # outside that prefix, so the surface is cluster-internal. Pack BEs (cuopt,
+    # vss, …) DO have ingress and MUST gate their docs by DEBUG=false.
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    contact={
+        "name": "OCI AI Accelerator Team",
+        "url": "https://github.com/oci-ai-incubations/accelerator-pack-auth-service",
+    },
+    license_info={
+        "name": "Universal Permissive License v1.0",
+        "url": "https://oss.oracle.com/licenses/upl",
+    },
+    servers=[
+        {"url": "http://localhost:8080", "description": "Local development"},
+    ],
+    openapi_tags=OPENAPI_TAGS,
+    lifespan=lifespan,
+)
 app.state.limiter = limiter
+
+
+def custom_openapi() -> dict:
+    """Return the OpenAPI schema with a bearerAuth security scheme applied globally.
+
+    Public endpoints opt out per-route by passing
+    ``openapi_extra={"security": []}`` in their decorator; everything else
+    inherits the default Bearer requirement so the Swagger UI lock icon
+    reflects reality.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=OPENAPI_TAGS,
+        servers=app.servers,
+        contact=app.contact,
+        license_info=app.license_info,
+    )
+    schema.setdefault("components", {})["securitySchemes"] = {
+        "bearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": (
+                "JWT access token from `POST /auth/login` or `POST /auth/sso/{slug}/token`."
+            ),
+        }
+    }
+    schema["security"] = [{"bearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 # CORS — configurable via AUTH_CORS_ORIGINS
 origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
@@ -136,17 +235,52 @@ def _build_token_response(access_token: str, refresh_token: str, user: User) -> 
 # ── Health ────────────────────────────────────────
 
 
-@app.get("/auth/health")
+@app.get(
+    "/auth/health",
+    summary="Readiness probe",
+    description=(
+        "Lightweight readiness check. Returns `{status, service, version}`. "
+        "Public — no authentication required. Used by ingress and Kubernetes "
+        "readinessProbe."
+    ),
+    tags=["Health"],
+    responses={200: {"description": "Service is healthy"}},
+    openapi_extra={"security": []},
+)
 async def health():
-    return {"status": "healthy", "service": "auth", "version": "1.0.0"}
+    return {"status": "healthy", "service": "auth"}
 
 
-@app.get("/auth/alive")
+@app.get(
+    "/auth/alive",
+    summary="Liveness probe",
+    description=(
+        "Lightweight liveness check used by Kubernetes livenessProbe. Public — "
+        "no authentication required. Returns `{status: alive}` whenever the "
+        "process is up."
+    ),
+    tags=["Health"],
+    responses={200: {"description": "Process is alive"}},
+    openapi_extra={"security": []},
+)
 async def alive():
     return {"status": "alive"}
 
 
-@app.get("/auth/pack/model")
+@app.get(
+    "/auth/pack/model",
+    summary="Get active pack auth model",
+    description=(
+        "Return the active `PackAuthModel` (pack_id, roles, permissions, "
+        "role→permission map) selected by the `AUTH_PACK` env var. Public — "
+        "frontends call this from the login page to discover which roles and "
+        "admin tabs the deployment exposes so the UI renders only the relevant "
+        "controls."
+    ),
+    tags=["Health"],
+    responses={200: {"description": "Active pack model"}},
+    openapi_extra={"security": []},
+)
 async def get_pack_model() -> dict:
     """Return the active pack auth model.
 
@@ -162,7 +296,28 @@ async def get_pack_model() -> dict:
 # ── Registration & Login ──────────────────────────
 
 
-@app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/auth/register",
+    response_model=TokenResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a new local user",
+    description=(
+        "Create a new local-auth user with email + password and return an "
+        "access/refresh token pair. The first user registered on a fresh "
+        "deployment is auto-elevated to `admin` when `AUTH_AUTO_ADMIN_FIRST_USER` "
+        "is true (default); subsequent users are seeded with the `pending` role. "
+        "Gated by `AUTH_LOCAL_AUTH_ENABLED` — returns 403 when only SSO is allowed."
+    ),
+    tags=["Authentication"],
+    responses={
+        201: {"description": "User created and token pair issued"},
+        403: {"description": "Local authentication is disabled (SSO-only deployment)"},
+        409: {"description": "Email already registered"},
+        422: {"description": "Validation error on the request body"},
+        429: {"description": "Registration rate limit exceeded"},
+    },
+    openapi_extra={"security": []},
+)
 @limiter.limit(settings.rate_limit_register)
 async def register(request: Request, req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     _require_local_auth()
@@ -191,7 +346,27 @@ async def register(request: Request, req: RegisterRequest, db: AsyncSession = De
     return _build_token_response(access_token, refresh_value, user)
 
 
-@app.post("/auth/login", response_model=TokenResponse)
+@app.post(
+    "/auth/login",
+    response_model=TokenResponse,
+    summary="Log in with email + password",
+    description=(
+        "Authenticate a local user with email + password and return an "
+        "access/refresh token pair. Failed attempts are recorded and trigger "
+        "account lockout after `AUTH_ACCOUNT_LOCKOUT_THRESHOLD` consecutive "
+        "failures. Per-user concurrent sessions are capped at "
+        "`AUTH_MAX_CONCURRENT_SESSIONS`."
+    ),
+    tags=["Authentication"],
+    responses={
+        200: {"description": "Token pair issued"},
+        401: {"description": "Invalid credentials or account locked"},
+        403: {"description": "Local authentication is disabled or account is deactivated"},
+        422: {"description": "Validation error on the request body"},
+        429: {"description": "Login rate limit exceeded"},
+    },
+    openapi_extra={"security": []},
+)
 @limiter.limit(settings.rate_limit_login)
 async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(get_db)):
     _require_local_auth()
@@ -221,7 +396,23 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
     return _build_token_response(access_token, refresh_value, user)
 
 
-@app.post("/auth/refresh", response_model=TokenResponse)
+@app.post(
+    "/auth/refresh",
+    response_model=TokenResponse,
+    summary="Refresh access token",
+    description=(
+        "Exchange a valid refresh token for a fresh access/refresh pair. The "
+        "supplied refresh token is rotated out (marked revoked) and replaced "
+        "with a new one, so each refresh token is single-use."
+    ),
+    tags=["Authentication"],
+    responses={
+        200: {"description": "New token pair issued"},
+        401: {"description": "Refresh token invalid, expired, revoked, or user inactive"},
+        422: {"description": "Validation error on the request body"},
+    },
+    openapi_extra={"security": []},
+)
 async def refresh_token(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
     stored = await validate_refresh_token(db, req.refresh_token)
     if not stored:
@@ -249,7 +440,21 @@ async def refresh_token(req: RefreshRequest, db: AsyncSession = Depends(get_db))
     return _build_token_response(new_access, new_refresh, user)
 
 
-@app.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+@app.post(
+    "/auth/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Log out (revoke all sessions)",
+    description=(
+        "Blacklist the current access token (by its `jti` until natural "
+        "expiry) and revoke every refresh token for the calling user — i.e. "
+        "log out from all devices."
+    ),
+    tags=["Authentication"],
+    responses={
+        204: {"description": "Logged out; all sessions terminated"},
+        401: {"description": "Access token missing or invalid"},
+    },
+)
 async def logout(
     request: Request,
     user: User = Depends(get_current_user),
@@ -267,7 +472,24 @@ async def logout(
     await revoke_user_tokens(db, user.id)
 
 
-@app.post("/auth/token/revoke", status_code=status.HTTP_204_NO_CONTENT)
+@app.post(
+    "/auth/token/revoke",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a specific access token",
+    description=(
+        "Blacklist a specific access token by its `jti` claim until its "
+        "natural expiry. Requires an authenticated caller — the calling token "
+        "and the revoked token can be the same or different (admin revocation "
+        "of another user's token is allowed)."
+    ),
+    tags=["Authentication"],
+    responses={
+        204: {"description": "Token revoked"},
+        400: {"description": "Supplied token has no `jti` claim"},
+        401: {"description": "Caller token missing or invalid"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def revoke_token(
     req: RevokeRequest,
     _user: User = Depends(get_current_user),
@@ -284,7 +506,21 @@ async def revoke_token(
 # ── Current User ──────────────────────────────────
 
 
-@app.get("/auth/me", response_model=UserResponse)
+@app.get(
+    "/auth/me",
+    response_model=UserResponse,
+    summary="Get the current user",
+    description=(
+        "Return the authenticated user's profile (id, email, name, role, "
+        "active flag, timestamps). Used by pack frontends to populate the "
+        "user menu and by pack backends as a cheap token-validation probe."
+    ),
+    tags=["Current User"],
+    responses={
+        200: {"description": "Authenticated user profile"},
+        401: {"description": "Token missing, invalid, expired, or blacklisted"},
+    },
+)
 async def get_me(user: User = Depends(get_current_user)):
     return UserResponse.model_validate(user)
 
@@ -292,13 +528,42 @@ async def get_me(user: User = Depends(get_current_user)):
 # ── User Management (admin only) ─────────────────
 
 
-@app.get("/auth/users", response_model=list[UserResponse])
+@app.get(
+    "/auth/users",
+    response_model=list[UserResponse],
+    summary="List all users",
+    description=(
+        "Return every user in the deployment ordered by creation date (newest first). Admin only."
+    ),
+    tags=["Users"],
+    responses={
+        200: {"description": "List of users"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def list_users(_admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).order_by(User.created_at.desc()))
     return [UserResponse.model_validate(u) for u in result.scalars().all()]
 
 
-@app.patch("/auth/users/{user_id}", response_model=UserResponse)
+@app.patch(
+    "/auth/users/{user_id}",
+    response_model=UserResponse,
+    summary="Update a user",
+    description=(
+        "Patch a user's role, active flag, or display name. Each change is "
+        "written to the audit log with the admin's identity. Admin only."
+    ),
+    tags=["Users"],
+    responses={
+        200: {"description": "Updated user"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "User not found"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def update_user(
     user_id: int,
     req: UpdateUserRequest,
@@ -336,6 +601,21 @@ async def update_user(
     "/auth/collections/{collection_id}/permissions",
     response_model=CollectionPermissionResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Grant a user access to a collection",
+    description=(
+        "Assign a user a permission level on a specific collection. Replaces "
+        "any existing grant for the (user, collection) pair. Legacy paas_rag "
+        "model — prefer the role/permission CRUD endpoints for new packs. "
+        "Admin only."
+    ),
+    tags=["Collections"],
+    responses={
+        201: {"description": "Permission granted"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "User not found"},
+        422: {"description": "Validation error on the request body"},
+    },
 )
 async def assign_collection_permission(
     collection_id: str,
@@ -383,6 +663,15 @@ async def assign_collection_permission(
 @app.delete(
     "/auth/collections/{collection_id}/permissions/{user_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a user's access to a collection",
+    description=("Remove a user's permission entry for a collection. Audit-logged. Admin only."),
+    tags=["Collections"],
+    responses={
+        204: {"description": "Permission revoked"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Permission grant not found"},
+    },
 )
 async def revoke_collection_permission(
     collection_id: str,
@@ -405,6 +694,17 @@ async def revoke_collection_permission(
 @app.get(
     "/auth/collections/{collection_id}/permissions",
     response_model=list[CollectionPermissionResponse],
+    summary="List a collection's permission grants",
+    description=(
+        "Return every user with explicit access to the collection, with "
+        "their permission level and email. Admin only."
+    ),
+    tags=["Collections"],
+    responses={
+        200: {"description": "List of permission grants"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
 )
 async def list_collection_permissions(
     collection_id: str,
@@ -428,7 +728,21 @@ async def list_collection_permissions(
     ]
 
 
-@app.get("/auth/collections/my-access", response_model=list[MyCollectionAccess])
+@app.get(
+    "/auth/collections/my-access",
+    response_model=list[MyCollectionAccess],
+    summary="List my collection access",
+    description=(
+        "Return the calling user's explicit per-collection permission grants. "
+        "Returns an empty list for admin callers — admins have implicit "
+        "access to every collection."
+    ),
+    tags=["Collections"],
+    responses={
+        200: {"description": "User's collection grants"},
+        401: {"description": "Token missing or invalid"},
+    },
+)
 async def get_my_collection_access(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -470,7 +784,21 @@ async def _build_role_response(db: AsyncSession, role: DbRole) -> RoleResponse:
     )
 
 
-@app.get("/auth/roles", response_model=list[RoleResponse])
+@app.get(
+    "/auth/roles",
+    response_model=list[RoleResponse],
+    summary="List roles",
+    description=(
+        "Return every role known to the deployment, with each role's bound "
+        "permission codenames. Requires the `roles:list` permission."
+    ),
+    tags=["Roles"],
+    responses={
+        200: {"description": "List of roles"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller lacks `roles:list` permission"},
+    },
+)
 async def list_roles(
     _user: User = Depends(require_permission("roles:list")),
     db: AsyncSession = Depends(get_db),
@@ -480,7 +808,24 @@ async def list_roles(
     return [await _build_role_response(db, r) for r in roles]
 
 
-@app.post("/auth/roles", response_model=RoleResponse, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/auth/roles",
+    response_model=RoleResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a role",
+    description=(
+        "Create a new tenant-scoped role. Role names must be unique within "
+        "their tenant. Requires the `roles:create` permission."
+    ),
+    tags=["Roles"],
+    responses={
+        201: {"description": "Role created"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller lacks `roles:create` permission"},
+        409: {"description": "Role name already exists in this tenant"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def create_role(
     req: RoleCreate,
     admin: User = Depends(require_permission("roles:create")),
@@ -505,7 +850,22 @@ async def create_role(
     return await _build_role_response(db, role)
 
 
-@app.get("/auth/roles/{role_id}", response_model=RoleResponse)
+@app.get(
+    "/auth/roles/{role_id}",
+    response_model=RoleResponse,
+    summary="Get a role by id",
+    description=(
+        "Return a single role's definition and bound permissions. Requires "
+        "the `roles:read` permission."
+    ),
+    tags=["Roles"],
+    responses={
+        200: {"description": "Role detail"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller lacks `roles:read` permission"},
+        404: {"description": "Role not found"},
+    },
+)
 async def get_role(
     role_id: int,
     _user: User = Depends(require_permission("roles:read")),
@@ -518,7 +878,24 @@ async def get_role(
     return await _build_role_response(db, role)
 
 
-@app.patch("/auth/roles/{role_id}", response_model=RoleResponse)
+@app.patch(
+    "/auth/roles/{role_id}",
+    response_model=RoleResponse,
+    summary="Update a role",
+    description=(
+        "Patch a custom role's name, description, or default-assignment flag. "
+        "System-seeded roles are immutable and return 403. Requires the "
+        "`roles:update` permission."
+    ),
+    tags=["Roles"],
+    responses={
+        200: {"description": "Updated role"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "System role cannot be modified, or caller lacks `roles:update`"},
+        404: {"description": "Role not found"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def update_role(
     role_id: int,
     req: RoleUpdate,
@@ -547,7 +924,22 @@ async def update_role(
     return await _build_role_response(db, role)
 
 
-@app.delete("/auth/roles/{role_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/auth/roles/{role_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a role",
+    description=(
+        "Delete a custom role. System-seeded roles cannot be deleted and "
+        "return 403. Requires the `roles:delete` permission."
+    ),
+    tags=["Roles"],
+    responses={
+        204: {"description": "Role deleted"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "System role cannot be deleted, or caller lacks `roles:delete`"},
+        404: {"description": "Role not found"},
+    },
+)
 async def delete_role(
     role_id: int,
     admin: User = Depends(require_permission("roles:delete")),
@@ -566,7 +958,24 @@ async def delete_role(
     await log_audit(db, admin.id, "delete_role", f"role={role.name}")
 
 
-@app.put("/auth/roles/{role_id}/permissions", response_model=RoleResponse)
+@app.put(
+    "/auth/roles/{role_id}/permissions",
+    response_model=RoleResponse,
+    summary="Set a role's permissions",
+    description=(
+        "Replace the full permission set bound to a custom role. Unknown "
+        "permission codenames in the payload are silently skipped. System "
+        "roles return 403. Requires the `roles:update` permission."
+    ),
+    tags=["Roles"],
+    responses={
+        200: {"description": "Role permissions updated"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "System role cannot be modified, or caller lacks `roles:update`"},
+        404: {"description": "Role not found"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def set_role_permissions(
     role_id: int,
     req: RolePermissionUpdate,
@@ -597,7 +1006,22 @@ async def set_role_permissions(
 # ── Permissions (Phase 2) ────────────────────────
 
 
-@app.get("/auth/permissions", response_model=list[PermissionResponse])
+@app.get(
+    "/auth/permissions",
+    response_model=list[PermissionResponse],
+    summary="List all permissions",
+    description=(
+        "Return the catalog of permission codenames known to the deployment "
+        "(seeded by the active pack model). Requires the `permissions:list` "
+        "permission."
+    ),
+    tags=["Permissions"],
+    responses={
+        200: {"description": "List of permissions"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller lacks `permissions:list`"},
+    },
+)
 async def list_permissions(
     _user: User = Depends(require_permission("permissions:list")),
     db: AsyncSession = Depends(get_db),
@@ -606,7 +1030,25 @@ async def list_permissions(
     return [PermissionResponse.model_validate(p) for p in result.scalars().all()]
 
 
-@app.post("/auth/permissions/check", response_model=PermissionCheckResult)
+@app.post(
+    "/auth/permissions/check",
+    response_model=PermissionCheckResult,
+    summary="Check a user's permission",
+    description=(
+        "Evaluate whether a given user holds a specific permission, "
+        "optionally scoped to a resource (`resource_type` + `resource_id`). "
+        "Checks role bindings, direct grants, and resource ownership. "
+        "Requires the `permissions:check` permission."
+    ),
+    tags=["Permissions"],
+    responses={
+        200: {"description": "Permission check result"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller lacks `permissions:check`"},
+        404: {"description": "Target user not found"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def check_user_permission(
     req: PermissionCheck,
     _admin: User = Depends(require_permission("permissions:check")),
@@ -626,7 +1068,18 @@ async def check_user_permission(
 # ── User Role Assignments (Phase 2) ──────────────
 
 
-@app.get("/auth/users/{user_id}/roles", response_model=list[UserRoleResponse])
+@app.get(
+    "/auth/users/{user_id}/roles",
+    response_model=list[UserRoleResponse],
+    summary="List a user's role assignments",
+    description=("Return every (role, tenant, scope) assignment for the given user. Admin only."),
+    tags=["User Roles"],
+    responses={
+        200: {"description": "User's role assignments"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def list_user_roles(
     user_id: int,
     _admin: User = Depends(require_admin),
@@ -656,6 +1109,20 @@ async def list_user_roles(
     "/auth/users/{user_id}/roles",
     response_model=UserRoleResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Assign a role to a user",
+    description=(
+        "Create a new role assignment for the user, optionally scoped to a "
+        "tenant and/or resource (`scope_type`, `scope_id`). Audit-logged "
+        "with the granting admin's id. Admin only."
+    ),
+    tags=["User Roles"],
+    responses={
+        201: {"description": "Role assigned"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "User or role not found"},
+        422: {"description": "Validation error on the request body"},
+    },
 )
 async def assign_user_role(
     user_id: int,
@@ -700,7 +1167,22 @@ async def assign_user_role(
     )
 
 
-@app.delete("/auth/users/{user_id}/roles/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/auth/users/{user_id}/roles/{assignment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a role assignment from a user",
+    description=(
+        "Delete a specific role assignment by id, scoped to the given user. "
+        "Audit-logged. Admin only."
+    ),
+    tags=["User Roles"],
+    responses={
+        204: {"description": "Assignment removed"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Assignment not found"},
+    },
+)
 async def remove_user_role(
     user_id: int,
     assignment_id: int,
@@ -723,7 +1205,21 @@ async def remove_user_role(
 # ── Identity Providers (Phase 3) ──────────────────
 
 
-@app.get("/auth/providers", response_model=list[ProviderResponse])
+@app.get(
+    "/auth/providers",
+    response_model=list[ProviderResponse],
+    summary="List identity providers",
+    description=(
+        "Return every configured OIDC/SAML identity provider, ordered by "
+        "priority (highest first). Admin only."
+    ),
+    tags=["Identity Providers"],
+    responses={
+        200: {"description": "List of providers"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def list_providers(
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
@@ -732,7 +1228,25 @@ async def list_providers(
     return [ProviderResponse.model_validate(p) for p in result.scalars().all()]
 
 
-@app.post("/auth/providers", response_model=ProviderResponse, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/auth/providers",
+    response_model=ProviderResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create an identity provider",
+    description=(
+        "Register a new OIDC or SAML identity provider. The `slug` must be "
+        "unique across providers and is used in `/auth/sso/{slug}/...` URLs. "
+        "Admin only."
+    ),
+    tags=["Identity Providers"],
+    responses={
+        201: {"description": "Provider created"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        409: {"description": "Provider slug already exists"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def create_provider(
     req: ProviderCreate,
     admin: User = Depends(require_admin),
@@ -759,7 +1273,19 @@ async def create_provider(
     return ProviderResponse.model_validate(provider)
 
 
-@app.get("/auth/providers/{provider_id}", response_model=ProviderResponse)
+@app.get(
+    "/auth/providers/{provider_id}",
+    response_model=ProviderResponse,
+    summary="Get an identity provider",
+    description="Return a provider's full configuration (including secrets). Admin only.",
+    tags=["Identity Providers"],
+    responses={
+        200: {"description": "Provider detail"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Provider not found"},
+    },
+)
 async def get_provider(
     provider_id: int,
     _admin: User = Depends(require_admin),
@@ -772,7 +1298,23 @@ async def get_provider(
     return ProviderResponse.model_validate(provider)
 
 
-@app.patch("/auth/providers/{provider_id}", response_model=ProviderResponse)
+@app.patch(
+    "/auth/providers/{provider_id}",
+    response_model=ProviderResponse,
+    summary="Update an identity provider",
+    description=(
+        "Patch a provider's name, config, active flag, or priority. The slug "
+        "and type are immutable. Admin only."
+    ),
+    tags=["Identity Providers"],
+    responses={
+        200: {"description": "Updated provider"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Provider not found"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def update_provider(
     provider_id: int,
     req: ProviderUpdate,
@@ -799,7 +1341,23 @@ async def update_provider(
     return ProviderResponse.model_validate(provider)
 
 
-@app.delete("/auth/providers/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/auth/providers/{provider_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete an identity provider",
+    description=(
+        "Permanently delete a provider and its claim mappings. Existing "
+        "external-identity links are orphaned but preserved. Audit-logged. "
+        "Admin only."
+    ),
+    tags=["Identity Providers"],
+    responses={
+        204: {"description": "Provider deleted"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Provider not found"},
+    },
+)
 async def delete_provider(
     provider_id: int,
     admin: User = Depends(require_admin),
@@ -817,7 +1375,22 @@ async def delete_provider(
 # ── Claim Mappings (Phase 3) ─────────────────────
 
 
-@app.get("/auth/providers/{provider_id}/mappings", response_model=list[ClaimMappingResponse])
+@app.get(
+    "/auth/providers/{provider_id}/mappings",
+    response_model=list[ClaimMappingResponse],
+    summary="List a provider's claim→role mappings",
+    description=(
+        "Return every claim-to-role mapping configured for this provider, "
+        "ordered by priority (highest first). Mappings drive automatic role "
+        "assignment during SSO sign-in. Admin only."
+    ),
+    tags=["Claim Mappings"],
+    responses={
+        200: {"description": "List of claim mappings"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def list_claim_mappings(
     provider_id: int,
     _admin: User = Depends(require_admin),
@@ -835,6 +1408,20 @@ async def list_claim_mappings(
     "/auth/providers/{provider_id}/mappings",
     response_model=ClaimMappingResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Create a claim→role mapping",
+    description=(
+        "Define a rule that grants the named role when an SSO claim matches "
+        "the supplied value (or regex pattern). Higher-priority mappings "
+        "evaluate first. Admin only."
+    ),
+    tags=["Claim Mappings"],
+    responses={
+        201: {"description": "Mapping created"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Provider or role not found"},
+        422: {"description": "Validation error on the request body"},
+    },
 )
 async def create_claim_mapping(
     provider_id: int,
@@ -872,6 +1459,15 @@ async def create_claim_mapping(
 @app.delete(
     "/auth/providers/{provider_id}/mappings/{mapping_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a claim mapping",
+    description=("Remove a single claim→role rule for this provider. Audit-logged. Admin only."),
+    tags=["Claim Mappings"],
+    responses={
+        204: {"description": "Mapping deleted"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Mapping not found"},
+    },
 )
 async def delete_claim_mapping(
     provider_id: int,
@@ -896,7 +1492,25 @@ async def delete_claim_mapping(
 # ── SSO Callback (Phase 3) ───────────────────────
 
 
-@app.post("/auth/sso/callback", response_model=TokenResponse)
+@app.post(
+    "/auth/sso/callback",
+    response_model=TokenResponse,
+    summary="SSO callback (internal handoff)",
+    description=(
+        "Generic SSO callback invoked by OIDC/SAML handlers after the "
+        "external assertion has been validated. JIT-provisions the user, "
+        "applies claim→role mappings, and returns an internal token pair. "
+        "Public (no auth) but expects a pre-validated payload — production "
+        "deployments call this internally from the OIDC callback / SAML ACS."
+    ),
+    tags=["SSO"],
+    responses={
+        200: {"description": "Token pair issued for the SSO user"},
+        400: {"description": "Missing `provider_slug` in request body"},
+        404: {"description": "Provider not found or inactive"},
+    },
+    openapi_extra={"security": []},
+)
 async def sso_callback(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -944,7 +1558,18 @@ async def sso_callback(
 # ── SSO Public Discovery & OIDC Flow ─────────────
 
 
-@app.get("/auth/sso/providers")
+@app.get(
+    "/auth/sso/providers",
+    summary="List public SSO providers",
+    description=(
+        "Return the public-facing list of active SSO providers (id, type, "
+        "name, slug). Frontends call this from the login page to render the "
+        'list of "Sign in with X" buttons. Public — no auth required.'
+    ),
+    tags=["SSO"],
+    responses={200: {"description": "Public list of active SSO providers"}},
+    openapi_extra={"security": []},
+)
 async def list_public_providers(db: AsyncSession = Depends(get_db)):
     """Public endpoint: returns active SSO providers for the login page."""
     result = await db.execute(
@@ -958,7 +1583,22 @@ async def list_public_providers(db: AsyncSession = Depends(get_db)):
     ]
 
 
-@app.get("/auth/sso/{slug}/authorize")
+@app.get(
+    "/auth/sso/{slug}/authorize",
+    summary="Build SSO authorize URL",
+    description=(
+        "Return the IdP-specific authorization URL for the frontend to "
+        "redirect to. Generates the `state` (CSRF) and `nonce` (OIDC replay) "
+        "tokens. Public — no auth required."
+    ),
+    tags=["SSO"],
+    responses={
+        200: {"description": "Authorize URL plus opaque `state` for callback"},
+        400: {"description": "Provider type is not supported"},
+        404: {"description": "Provider not found or inactive"},
+    },
+    openapi_extra={"security": []},
+)
 async def sso_authorize(
     slug: str,
     redirect_uri: str,
@@ -1014,7 +1654,23 @@ async def sso_authorize(
     )
 
 
-@app.post("/auth/sso/{slug}/token", response_model=TokenResponse)
+@app.post(
+    "/auth/sso/{slug}/token",
+    response_model=TokenResponse,
+    summary="Exchange SSO code for internal tokens",
+    description=(
+        "Exchange the OIDC authorization `code` for a fresh internal "
+        "access/refresh token pair. The auth-service performs the IdP token "
+        "exchange server-side, JIT-provisions the user, applies claim→role "
+        "mappings, and issues internal JWTs. Public — no auth required."
+    ),
+    tags=["SSO"],
+    responses={
+        200: {"description": "Token pair issued"},
+        404: {"description": "Provider not found or inactive"},
+    },
+    openapi_extra={"security": []},
+)
 async def sso_token_exchange(
     slug: str,
     request: Request,
@@ -1062,7 +1718,17 @@ async def sso_token_exchange(
 # ── Groups (Phase 4, admin) ───────────────────────
 
 
-@app.get("/auth/groups")
+@app.get(
+    "/auth/groups",
+    summary="List groups",
+    description=("Return every group (local or SCIM-provisioned) ordered by name. Admin only."),
+    tags=["Groups"],
+    responses={
+        200: {"description": "List of groups"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def list_groups(
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
@@ -1083,7 +1749,19 @@ async def list_groups(
     ]
 
 
-@app.post("/auth/groups", status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/auth/groups",
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a group",
+    description="Create a new local group. Audit-logged. Admin only.",
+    tags=["Groups"],
+    responses={
+        201: {"description": "Group created"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def create_group(
     request: Request,
     admin: User = Depends(require_admin),
@@ -1105,7 +1783,17 @@ async def create_group(
     return {"id": group.id, "name": group.name, "display_name": group.display_name}
 
 
-@app.get("/auth/groups/{group_id}/members")
+@app.get(
+    "/auth/groups/{group_id}/members",
+    summary="List a group's members",
+    description="Return every user belonging to the group. Admin only.",
+    tags=["Groups"],
+    responses={
+        200: {"description": "List of member users"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def list_group_members(
     group_id: int,
     _admin: User = Depends(require_admin),
@@ -1121,7 +1809,19 @@ async def list_group_members(
     return [UserResponse.model_validate(u) for u in result.scalars().all()]
 
 
-@app.post("/auth/groups/{group_id}/members", status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/auth/groups/{group_id}/members",
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a member to a group",
+    description=("Add the supplied `user_id` to the group's membership. Audit-logged. Admin only."),
+    tags=["Groups"],
+    responses={
+        201: {"description": "Member added"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        422: {"description": "Validation error on the request body"},
+    },
+)
 async def add_group_member(
     group_id: int,
     request: Request,
@@ -1141,6 +1841,15 @@ async def add_group_member(
 @app.delete(
     "/auth/groups/{group_id}/members/{user_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a member from a group",
+    description="Remove the user from the group's membership. Admin only.",
+    tags=["Groups"],
+    responses={
+        204: {"description": "Member removed"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Membership not found"},
+    },
 )
 async def remove_group_member(
     group_id: int,
@@ -1163,7 +1872,20 @@ async def remove_group_member(
     await db.commit()
 
 
-@app.put("/auth/groups/{group_id}/roles")
+@app.put(
+    "/auth/groups/{group_id}/roles",
+    summary="Set a group's roles",
+    description=(
+        "Replace the full role-id list bound to the group. Members of the "
+        "group inherit every bound role. Audit-logged. Admin only."
+    ),
+    tags=["Groups"],
+    responses={
+        200: {"description": "Group roles updated"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def set_group_roles(
     group_id: int,
     request: Request,
@@ -1188,24 +1910,72 @@ async def set_group_roles(
 # ── SCIM 2.0 (Phase 4) ──────────────────────────
 
 
-@app.get("/scim/v2/ServiceProviderConfig")
+@app.get(
+    "/scim/v2/ServiceProviderConfig",
+    summary="SCIM service-provider config",
+    description=(
+        "RFC 7643 §5: advertise SCIM 2.0 capabilities (patch, bulk, filter, "
+        "etag, change-password, sort, auth schemes) supported by this server."
+    ),
+    tags=["SCIM"],
+    responses={
+        200: {"description": "SCIM ServiceProviderConfig document"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+    },
+)
 async def scim_service_provider_config(
     _token: str = Depends(scim_service.require_scim_auth),
 ):
     return scim_service.SCIM_SERVICE_PROVIDER_CONFIG
 
 
-@app.get("/scim/v2/Schemas")
+@app.get(
+    "/scim/v2/Schemas",
+    summary="SCIM schemas",
+    description=(
+        "RFC 7644 §4: return the SCIM 2.0 schema definitions supported by "
+        "this server (User, Group, EnterpriseUser)."
+    ),
+    tags=["SCIM"],
+    responses={
+        200: {"description": "SCIM schema catalog"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+    },
+)
 async def scim_schemas(_token: str = Depends(scim_service.require_scim_auth)):
     return scim_service.SCIM_SCHEMAS
 
 
-@app.get("/scim/v2/ResourceTypes")
+@app.get(
+    "/scim/v2/ResourceTypes",
+    summary="SCIM resource types",
+    description=(
+        "RFC 7644 §4: return the SCIM 2.0 resource types this server exposes (Users, Groups)."
+    ),
+    tags=["SCIM"],
+    responses={
+        200: {"description": "SCIM resource-type catalog"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+    },
+)
 async def scim_resource_types(_token: str = Depends(scim_service.require_scim_auth)):
     return scim_service.SCIM_RESOURCE_TYPES
 
 
-@app.get("/scim/v2/Users")
+@app.get(
+    "/scim/v2/Users",
+    summary="SCIM: list users",
+    description=(
+        "RFC 7644 §3.4.2: return all users wrapped in a SCIM ListResponse. "
+        "Pagination, filtering, and sorting are not implemented in this "
+        "release."
+    ),
+    tags=["SCIM"],
+    responses={
+        200: {"description": "SCIM ListResponse of users"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+    },
+)
 async def scim_list_users(
     _token: str = Depends(scim_service.require_scim_auth),
     db: AsyncSession = Depends(get_db),
@@ -1219,7 +1989,20 @@ async def scim_list_users(
     }
 
 
-@app.post("/scim/v2/Users", status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/scim/v2/Users",
+    status_code=status.HTTP_201_CREATED,
+    summary="SCIM: create user",
+    description=(
+        "RFC 7644 §3.3: provision a user from a SCIM User resource. Maps "
+        "SCIM `userName`/`emails`/`active` into the local user model."
+    ),
+    tags=["SCIM"],
+    responses={
+        201: {"description": "User created and returned as SCIM resource"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+    },
+)
 async def scim_create_user_endpoint(
     request: Request,
     _token: str = Depends(scim_service.require_scim_auth),
@@ -1230,7 +2013,17 @@ async def scim_create_user_endpoint(
     return scim_service.user_to_scim(user)
 
 
-@app.get("/scim/v2/Users/{user_id}")
+@app.get(
+    "/scim/v2/Users/{user_id}",
+    summary="SCIM: get user",
+    description="RFC 7644 §3.4.1: return a single user as a SCIM resource.",
+    tags=["SCIM"],
+    responses={
+        200: {"description": "SCIM User resource"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+        404: {"description": "User not found"},
+    },
+)
 async def scim_get_user(
     user_id: int,
     _token: str = Depends(scim_service.require_scim_auth),
@@ -1243,7 +2036,20 @@ async def scim_get_user(
     return scim_service.user_to_scim(user)
 
 
-@app.put("/scim/v2/Users/{user_id}")
+@app.put(
+    "/scim/v2/Users/{user_id}",
+    summary="SCIM: replace user",
+    description=(
+        "RFC 7644 §3.5.1: full-resource replace of a SCIM User. Updates "
+        "name, emails, and active flag from the request body."
+    ),
+    tags=["SCIM"],
+    responses={
+        200: {"description": "Updated SCIM User resource"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+        404: {"description": "User not found"},
+    },
+)
 async def scim_replace_user(
     user_id: int,
     request: Request,
@@ -1259,7 +2065,22 @@ async def scim_replace_user(
     return scim_service.user_to_scim(user)
 
 
-@app.delete("/scim/v2/Users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/scim/v2/Users/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="SCIM: deprovision user",
+    description=(
+        "RFC 7644 §3.6: deprovision a user. Marks the user inactive (soft "
+        "delete) and revokes every refresh token, forcing logout from all "
+        "sessions."
+    ),
+    tags=["SCIM"],
+    responses={
+        204: {"description": "User deactivated and tokens revoked"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+        404: {"description": "User not found"},
+    },
+)
 async def scim_delete_user(
     user_id: int,
     _token: str = Depends(scim_service.require_scim_auth),
@@ -1274,7 +2095,16 @@ async def scim_delete_user(
     await revoke_user_tokens(db, user.id)
 
 
-@app.get("/scim/v2/Groups")
+@app.get(
+    "/scim/v2/Groups",
+    summary="SCIM: list groups",
+    description="RFC 7644 §3.4.2: return all groups wrapped in a SCIM ListResponse.",
+    tags=["SCIM"],
+    responses={
+        200: {"description": "SCIM ListResponse of groups"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+    },
+)
 async def scim_list_groups(
     _token: str = Depends(scim_service.require_scim_auth),
     db: AsyncSession = Depends(get_db),
@@ -1290,7 +2120,20 @@ async def scim_list_groups(
     }
 
 
-@app.post("/scim/v2/Groups", status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/scim/v2/Groups",
+    status_code=status.HTTP_201_CREATED,
+    summary="SCIM: create group",
+    description=(
+        "RFC 7644 §3.3: provision a group from a SCIM Group resource. "
+        "Member references in the payload are resolved against local users."
+    ),
+    tags=["SCIM"],
+    responses={
+        201: {"description": "Group created and returned as SCIM resource"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+    },
+)
 async def scim_create_group_endpoint(
     request: Request,
     _token: str = Depends(scim_service.require_scim_auth),
@@ -1301,7 +2144,17 @@ async def scim_create_group_endpoint(
     return scim_service.group_to_scim(group)
 
 
-@app.get("/scim/v2/Groups/{group_id}")
+@app.get(
+    "/scim/v2/Groups/{group_id}",
+    summary="SCIM: get group",
+    description="RFC 7644 §3.4.1: return a single group as a SCIM resource.",
+    tags=["SCIM"],
+    responses={
+        200: {"description": "SCIM Group resource"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+        404: {"description": "Group not found"},
+    },
+)
 async def scim_get_group(
     group_id: int,
     _token: str = Depends(scim_service.require_scim_auth),
@@ -1316,7 +2169,20 @@ async def scim_get_group(
     return scim_service.group_to_scim(group)
 
 
-@app.put("/scim/v2/Groups/{group_id}")
+@app.put(
+    "/scim/v2/Groups/{group_id}",
+    summary="SCIM: replace group",
+    description=(
+        "RFC 7644 §3.5.1: full-resource replace of a SCIM Group. Updates "
+        "display name and member set."
+    ),
+    tags=["SCIM"],
+    responses={
+        200: {"description": "Updated SCIM Group resource"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+        404: {"description": "Group not found"},
+    },
+)
 async def scim_replace_group(
     group_id: int,
     request: Request,
@@ -1334,7 +2200,18 @@ async def scim_replace_group(
     return scim_service.group_to_scim(group)
 
 
-@app.delete("/scim/v2/Groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/scim/v2/Groups/{group_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="SCIM: delete group",
+    description="RFC 7644 §3.6: permanently delete a SCIM group.",
+    tags=["SCIM"],
+    responses={
+        204: {"description": "Group deleted"},
+        401: {"description": "SCIM bearer token missing or invalid"},
+        404: {"description": "Group not found"},
+    },
+)
 async def scim_delete_group(
     group_id: int,
     _token: str = Depends(scim_service.require_scim_auth),
@@ -1353,7 +2230,21 @@ async def scim_delete_group(
 # ── Audit (Phase 5) ──────────────────────────────
 
 
-@app.get("/auth/audit")
+@app.get(
+    "/auth/audit",
+    summary="Query audit logs",
+    description=(
+        "Return audit events filtered by event_type, actor, target, and/or "
+        "result. Supports `offset`/`limit` pagination (default limit=50). "
+        "Requires the `admin.audit.view` permission."
+    ),
+    tags=["Audit"],
+    responses={
+        200: {"description": "Paginated audit log entries with total count"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller lacks `admin.audit.view`"},
+    },
+)
 async def query_audit(
     request: Request,
     _user: User = Depends(require_pack_permission("admin.audit.view")),
@@ -1380,7 +2271,21 @@ async def query_audit(
     }
 
 
-@app.get("/auth/audit/export")
+@app.get(
+    "/auth/audit/export",
+    summary="Export audit logs",
+    description=(
+        "Return up to 10,000 audit events as a JSON array for offline "
+        "analysis. Use NDJSON streaming for larger exports in production. "
+        "Requires the `admin.audit.view` permission."
+    ),
+    tags=["Audit"],
+    responses={
+        200: {"description": "JSON array of audit events"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller lacks `admin.audit.view`"},
+    },
+)
 async def export_audit(
     _user: User = Depends(require_pack_permission("admin.audit.view")),
     db: AsyncSession = Depends(get_db),
@@ -1392,7 +2297,21 @@ async def export_audit(
     return [audit_log_to_dict(log) for log in logs]
 
 
-@app.post("/auth/audit/purge")
+@app.post(
+    "/auth/audit/purge",
+    summary="Purge old audit logs",
+    description=(
+        "Delete audit log entries older than `AUTH_AUDIT_RETENTION_DAYS`. "
+        "Returns the number of rows deleted. The purge itself is audit-logged. "
+        "Admin only."
+    ),
+    tags=["Audit"],
+    responses={
+        200: {"description": "Number of audit rows deleted"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def purge_audit(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
@@ -1407,7 +2326,21 @@ async def purge_audit(
 # ── Admin Dashboard (Phase 6) ────────────────────
 
 
-@app.get("/auth/admin/status")
+@app.get(
+    "/auth/admin/status",
+    summary="Admin dashboard status",
+    description=(
+        "Return service version, active profile, feature flags, and rollup "
+        "counts (total/active users, active sessions, identity providers, "
+        "groups). Powers the admin dashboard landing tile. Admin only."
+    ),
+    tags=["Admin"],
+    responses={
+        200: {"description": "Status snapshot with feature flags + stats"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+    },
+)
 async def admin_status(
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
@@ -1425,7 +2358,7 @@ async def admin_status(
     group_count = await db.scalar(select(func.count()).select_from(Group))
 
     return {
-        "version": "1.0.0",
+        "version": __version__,
         "profile": settings.profile,
         "features": {
             "local_auth": settings.local_auth_enabled,
