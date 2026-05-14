@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
@@ -101,6 +101,20 @@ OAUTH2_ERROR_INVALID_CLIENT = "invalid_client"
 OAUTH2_ERROR_INVALID_REQUEST = "invalid_request"
 OAUTH2_ERROR_UNSUPPORTED_GRANT_TYPE = "unsupported_grant_type"
 OAUTH2_ERROR_INVALID_SCOPE = "invalid_scope"
+
+# RFC 6749 §5.1 mandates ``Cache-Control: no-store`` (and SHOULD ``Pragma: no-cache``)
+# on every response that could carry tokens — success AND error variants. Named
+# here so every token-bearing endpoint applies the same shape via
+# ``_apply_no_store(response)`` / by returning ``_oauth2_error(..., no_store=True)``.
+_NO_STORE_CACHE = "no-store"
+_NO_CACHE_PRAGMA = "no-cache"
+
+
+def _apply_no_store(response: Response) -> None:
+    """Stamp RFC 6749 §5.1 anti-caching headers on a token-bearing response."""
+    response.headers["Cache-Control"] = _NO_STORE_CACHE
+    response.headers["Pragma"] = _NO_CACHE_PRAGMA
+
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -404,13 +418,71 @@ async def get_jwks(response: Response, db: AsyncSession = Depends(get_db)) -> di
     return {"keys": [jwks_entry_for_key(k) for k in keys]}
 
 
+def _build_as_metadata() -> dict:
+    """Return the RFC 8414 Authorization Server Metadata document.
+
+    Auth-service is a token issuer, not a full OpenID Provider — we don't run
+    an authorization_endpoint of our own (the password grant lives at
+    ``/auth/login``, the client_credentials grant at ``/auth/oauth/token``).
+    Strict OIDC Discovery 1.0 verifiers (``aud`` checkers backed by jwks_uri
+    discovery, for example) accept this RFC 8414 shape; downstream callers
+    that want a "real" OIDC discovery doc should point at the federated IdP's
+    own ``.well-known/openid-configuration`` instead.
+
+    ``response_types_supported`` is omitted because we don't run any
+    authorization endpoint. ``grant_types_supported`` lists what we actually
+    accept.
+    """
+    issuer = settings.issuer_url
+    return {
+        "issuer": issuer,
+        "jwks_uri": f"{issuer}/.well-known/jwks.json",
+        "token_endpoint": f"{issuer}/oauth/token",
+        "userinfo_endpoint": f"{issuer}/me",
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        "grant_types_supported": ["password", "refresh_token", "client_credentials"],
+        "subject_types_supported": ["public"],
+    }
+
+
+@app.get(
+    "/auth/.well-known/oauth-authorization-server",
+    summary="OAuth 2.0 Authorization Server Metadata (RFC 8414)",
+    description=(
+        "RFC 8414 Authorization Server Metadata document. Auth-service is a "
+        "token issuer rather than a full OpenID Provider — it has no "
+        "authorization_endpoint of its own — so the AS-metadata shape is the "
+        "honest description of the surface. Frontends and verifiers that "
+        "need an OIDC Discovery 1.0 document can use the alias at "
+        "`/auth/.well-known/openid-configuration`, which returns the same body."
+    ),
+    tags=["Discovery"],
+    responses={
+        200: {"description": "Authorization server metadata"},
+        503: {"description": "Discovery not configured (AUTH_ISSUER_URL unset)"},
+    },
+    openapi_extra={"security": []},
+)
+async def get_as_metadata() -> dict:
+    if not settings.issuer_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Discovery not configured",
+        )
+    return _build_as_metadata()
+
+
 @app.get(
     "/auth/.well-known/openid-configuration",
-    summary="OIDC discovery document",
+    summary="OIDC discovery document (alias for RFC 8414 metadata)",
     description=(
-        "RFC 8414 OIDC discovery doc. Lets external verifiers auto-discover "
-        "the JWKS URL, token/userinfo endpoints, and supported signing "
-        "algorithms without out-of-band configuration."
+        "OIDC Discovery 1.0-compatible alias for "
+        "`/auth/.well-known/oauth-authorization-server`. Returns the same "
+        "RFC 8414 Authorization Server Metadata body. We don't expose an "
+        "authorization_endpoint because auth-service is a token issuer, not "
+        "an authorization server in the auth-code sense — verifiers that "
+        "need an authorization_endpoint should federate via an OIDC IdP."
     ),
     tags=["Discovery"],
     responses={
@@ -420,21 +492,12 @@ async def get_jwks(response: Response, db: AsyncSession = Depends(get_db)) -> di
     openapi_extra={"security": []},
 )
 async def get_oidc_discovery() -> dict:
-    issuer = settings.issuer_url
-    if not issuer:
+    if not settings.issuer_url:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="OIDC discovery not configured",
         )
-    return {
-        "issuer": issuer,
-        "jwks_uri": f"{issuer}/.well-known/jwks.json",
-        "token_endpoint": f"{issuer}/login",
-        "userinfo_endpoint": f"{issuer}/me",
-        "id_token_signing_alg_values_supported": ["RS256"],
-        "response_types_supported": ["token"],
-        "subject_types_supported": ["public"],
-    }
+    return _build_as_metadata()
 
 
 # ── Registration & Login ──────────────────────────
@@ -463,8 +526,14 @@ async def get_oidc_discovery() -> dict:
     openapi_extra={"security": []},
 )
 @limiter.limit(settings.rate_limit_register)
-async def register(request: Request, req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(
+    request: Request,
+    req: RegisterRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     _require_local_auth()
+    _apply_no_store(response)
     existing = await db.execute(select(User).where(User.email == req.email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
@@ -516,8 +585,14 @@ async def register(request: Request, req: RegisterRequest, db: AsyncSession = De
     openapi_extra={"security": []},
 )
 @limiter.limit(settings.rate_limit_login)
-async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(
+    request: Request,
+    req: LoginRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     _require_local_auth()
+    _apply_no_store(response)
     await check_account_lockout(db, req.email)
 
     result = await db.execute(select(User).where(User.email == req.email))
@@ -596,7 +671,12 @@ async def _grant_user_scopes(
     },
     openapi_extra={"security": []},
 )
-async def refresh_token(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
+async def refresh_token(
+    req: RefreshRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    _apply_no_store(response)
     stored = await validate_refresh_token(db, req.refresh_token)
     if not stored:
         raise HTTPException(
@@ -1411,6 +1491,39 @@ async def list_providers(
     return [ProviderResponse.model_validate(p) for p in result.scalars().all()]
 
 
+_OIDC_OVERRIDE_KEYS = ("token_url", "userinfo_url", "jwks_url", "authorize_url")
+
+
+async def _prefetch_oidc_discovery(provider_type: str, config: dict) -> None:
+    """Eager-validate an OIDC provider's discovery doc on create/update.
+
+    Catches misconfigured issuers at registration time rather than first
+    login — operators get a 422 with the IdP error inline, vs. a single
+    user hitting an opaque "Invalid ID token from IdP" weeks later.
+    SAML providers skip this check (no discovery surface).
+
+    If the operator has supplied every endpoint override
+    (``token_url``, ``userinfo_url``, ``jwks_url``, ``authorize_url``)
+    then the provider is fully self-described and the discovery probe is
+    skipped — useful for private IdPs that don't publish a discovery
+    document.
+    """
+    if provider_type != "oidc":
+        return
+    config = config or {}
+    if all(config.get(key) for key in _OIDC_OVERRIDE_KEYS):
+        return
+    issuer = config.get("issuer")
+    if not issuer:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="OIDC provider config must include 'issuer' or full endpoint overrides",
+        )
+    from .sso_service import discover_oidc_metadata
+
+    await discover_oidc_metadata(issuer)
+
+
 @app.post(
     "/auth/providers",
     response_model=ProviderResponse,
@@ -1438,6 +1551,8 @@ async def create_provider(
     existing = await db.execute(select(IdentityProvider).where(IdentityProvider.slug == req.slug))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug already exists")
+
+    await _prefetch_oidc_discovery(req.type.value, req.config)
 
     provider = IdentityProvider(
         type=req.type,
@@ -1508,6 +1623,9 @@ async def update_provider(
     provider = result.scalar_one_or_none()
     if not provider:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
+
+    if req.config is not None:
+        await _prefetch_oidc_discovery(provider.type.value, req.config)
 
     if req.name is not None:
         provider.name = req.name
@@ -1787,8 +1905,13 @@ async def sso_authorize(
     redirect_uri: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Build the IdP authorization URL for OIDC/SAML redirect."""
-    import secrets
+    """Build the IdP authorization URL for OIDC/SAML redirect.
+
+    Persists the minted ``(state, nonce)`` pair so the callback can verify it
+    is a state we minted, that it hasn't been used, and that the ID token's
+    ``nonce`` claim matches.
+    """
+    from .sso_service import store_sso_state
 
     result = await db.execute(
         select(IdentityProvider).where(
@@ -1800,8 +1923,7 @@ async def sso_authorize(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
 
     config = provider.config or {}
-    state = secrets.token_urlsafe(32)
-    nonce = secrets.token_urlsafe(16)
+    state, nonce = await store_sso_state(db, provider_id=provider.id, redirect_uri=redirect_uri)
 
     if provider.type.value == "oidc":
         issuer = config.get("issuer", "")
@@ -1850,6 +1972,8 @@ async def sso_authorize(
     tags=["SSO"],
     responses={
         200: {"description": "Token pair issued"},
+        400: {"description": "Missing, expired, or unknown state"},
+        401: {"description": "IdP ID-token verification failed (signature, nonce, claims)"},
         404: {"description": "Provider not found or inactive"},
     },
     openapi_extra={"security": []},
@@ -1859,10 +1983,24 @@ async def sso_token_exchange(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Exchange OIDC authorization code for internal JWT tokens."""
+    """Exchange OIDC authorization code for internal JWT tokens.
+
+    Requires the ``state`` minted at ``/authorize`` so the callback is
+    cryptographically tied to a prior authorize call from the same client.
+    The IdP's ID token is signature-verified against the IdP's JWKS and its
+    ``nonce`` claim is matched against the one we persisted before the
+    JIT-provisioning step runs.
+    """
     body = await request.json()
     code = body.get("code", "")
     redirect_uri = body.get("redirect_uri", "")
+    state = body.get("state", "")
+
+    if not state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_state", "error_description": "state parameter is required"},
+        )
 
     result = await db.execute(
         select(IdentityProvider).where(
@@ -1875,19 +2013,36 @@ async def sso_token_exchange(
 
     from .sso_service import (
         apply_claim_mappings,
+        consume_sso_state,
         exchange_oidc_code,
         issue_sso_tokens,
         jit_provision_user,
+        select_external_id,
     )
 
-    # Exchange code with IdP
-    user_info = await exchange_oidc_code(provider, code, redirect_uri)
+    # Single-use state consumption. The row is deleted whether or not the
+    # downstream IdP exchange succeeds — a leaked state is useless after one
+    # attempt, replay attempts return invalid_state.
+    state_row = await consume_sso_state(db, state=state, provider_id=provider.id)
 
-    # JIT provision
+    user_info = await exchange_oidc_code(
+        provider,
+        code,
+        redirect_uri,
+        expected_nonce=state_row.nonce,
+    )
+
+    external_id = select_external_id(user_info)
+    if not external_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="IdP claims missing a stable subject identifier (oid / user_id / sub)",
+        )
+
     user, _created = await jit_provision_user(
         db,
         provider,
-        external_id=user_info.get("sub", user_info.get("email", "")),
+        external_id=external_id,
         email=user_info.get("email", ""),
         name=user_info.get("name", "SSO User"),
         raw_claims=user_info,
@@ -2574,10 +2729,19 @@ def _oauth2_error(
 
     Callers return the response directly — raising HTTPException would bury
     the OAuth2 error fields under the FastAPI ``{"detail": ...}`` envelope
-    that integrators don't expect on the token endpoint.
+    that integrators don't expect on the token endpoint. RFC 6749 §5.1 also
+    requires the no-store / no-cache header pair on any response from a
+    token-issuing endpoint that *could* contain credentials, so the helper
+    stamps them unconditionally — including on every error variant.
     """
     body: dict[str, str] = {"error": error, "error_description": description}
-    return JSONResponse(status_code=http_status, content=body, headers=headers)
+    response_headers: dict[str, str] = {
+        "Cache-Control": _NO_STORE_CACHE,
+        "Pragma": _NO_CACHE_PRAGMA,
+    }
+    if headers:
+        response_headers.update(headers)
+    return JSONResponse(status_code=http_status, content=body, headers=response_headers)
 
 
 def _parse_basic_auth(header: str | None) -> tuple[str, str] | None:
@@ -2600,6 +2764,38 @@ def _parse_basic_auth(header: str | None) -> tuple[str, str] | None:
         return None
     client_id, _, client_secret = decoded.partition(":")
     return client_id, client_secret
+
+
+def _invalid_client_response(*, attempted_basic_auth: bool) -> JSONResponse:
+    """Return the RFC 6749 §5.2 invalid_client 401 with a correct challenge.
+
+    RFC 7235 §2.1 reserves ``WWW-Authenticate`` for declaring *attempted* auth
+    schemes; if the caller used form-body credentials, no HTTP auth scheme was
+    in play so emitting ``WWW-Authenticate: Basic`` would be a lie that some
+    HTTP clients translate into prompting the user for a Basic-auth username
+    and password. Emit it only when the caller actually tried Basic.
+    """
+    headers: dict[str, str] | None = None
+    if attempted_basic_auth:
+        headers = {"WWW-Authenticate": 'Basic realm="auth-service", error="invalid_client"'}
+    return _oauth2_error(
+        OAUTH2_ERROR_INVALID_CLIENT,
+        "Client authentication failed",
+        http_status=status.HTTP_401_UNAUTHORIZED,
+        headers=headers,
+    )
+
+
+def _is_form_urlencoded(content_type: str | None) -> bool:
+    """RFC 6749 §3.2: token endpoint accepts only ``application/x-www-form-urlencoded``.
+
+    Allows the standard parameter suffix (``; charset=utf-8`` etc.) and is
+    case-insensitive per RFC 7231.
+    """
+    if not content_type:
+        return False
+    base = content_type.split(";", 1)[0].strip().lower()
+    return base == "application/x-www-form-urlencoded"
 
 
 @app.post(
@@ -2630,12 +2826,30 @@ def _parse_basic_auth(header: str | None) -> tuple[str, str] | None:
 @limiter.limit(settings.rate_limit_oauth_token)
 async def oauth_token(
     request: Request,
-    grant_type: str = Form(...),
-    client_id: str | None = Form(None),
-    client_secret: str | None = Form(None),
-    scope: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
 ):
+    # RFC 6749 §3.2: the token endpoint MUST require
+    # ``application/x-www-form-urlencoded`` — reject anything else before
+    # parsing the form so a JSON-bodied request can't slip past as an empty
+    # grant_type and bubble up as a generic 422.
+    if not _is_form_urlencoded(request.headers.get("content-type")):
+        return _oauth2_error(
+            OAUTH2_ERROR_INVALID_REQUEST,
+            "Content-Type must be application/x-www-form-urlencoded",
+        )
+
+    form = await request.form()
+    grant_type = form.get("grant_type")
+    client_id = form.get("client_id")
+    client_secret = form.get("client_secret")
+    scope = form.get("scope")
+
+    if not grant_type:
+        return _oauth2_error(
+            OAUTH2_ERROR_INVALID_REQUEST,
+            "grant_type parameter is required",
+        )
+
     if not settings.client_credentials_enabled:
         # RFC 6749 §5.2 maps ``unsupported_grant_type`` to HTTP 400. 503
         # implied "transient" — but the master switch is an intentional ops
@@ -2653,6 +2867,7 @@ async def oauth_token(
 
     basic_credentials = _parse_basic_auth(request.headers.get("authorization"))
     form_has_credentials = client_id is not None or client_secret is not None
+    attempted_basic_auth = request.headers.get("authorization", "").lower().startswith("basic ")
 
     if basic_credentials is not None and form_has_credentials:
         # Per RFC 6749 §2.3.1, clients MUST NOT use more than one
@@ -2668,14 +2883,8 @@ async def oauth_token(
         presented_client_id = client_id or ""
         presented_client_secret = client_secret or ""
 
-    # Same response shape for every credential failure to prevent enumeration
-    # — RFC 6749 §5.2 invalid_client carries 401 + WWW-Authenticate per spec.
-    invalid_client_response = _oauth2_error(
-        OAUTH2_ERROR_INVALID_CLIENT,
-        "Client authentication failed",
-        http_status=status.HTTP_401_UNAUTHORIZED,
-        headers={"WWW-Authenticate": "Basic"},
-    )
+    # Same response shape for every credential failure to prevent enumeration.
+    invalid_client_response = _invalid_client_response(attempted_basic_auth=attempted_basic_auth)
 
     if not presented_client_id or not presented_client_secret:
         # Pay the bcrypt cost even on missing credentials so the response time
@@ -2726,12 +2935,15 @@ async def oauth_token(
         principal_id=account.client_id,
     )
 
-    return {
-        "access_token": token,
-        "token_type": "Bearer",
-        "expires_in": settings.client_token_expire_minutes * 60,
-        "scope": " ".join(issued_scopes),
-    }
+    return JSONResponse(
+        content={
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": settings.client_token_expire_minutes * 60,
+            "scope": " ".join(issued_scopes),
+        },
+        headers={"Cache-Control": _NO_STORE_CACHE, "Pragma": _NO_CACHE_PRAGMA},
+    )
 
 
 def _service_account_response(account: ServiceAccount) -> ServiceAccountResponse:
@@ -2785,10 +2997,12 @@ def require_client_credentials_enabled() -> None:
 )
 async def create_service_account_endpoint(
     req: ServiceAccountCreate,
+    response: Response,
     admin: User = Depends(require_admin),
     _master_switch: None = Depends(require_client_credentials_enabled),
     db: AsyncSession = Depends(get_db),
 ) -> ServiceAccountWithSecret:
+    _apply_no_store(response)
     existing = await clients.count_clients_for_owner(db, admin.id)
     if existing >= settings.client_max_per_owner:
         raise HTTPException(
@@ -2932,10 +3146,12 @@ async def update_service_account_endpoint(
 )
 async def rotate_service_account_secret_endpoint(
     client_pk: int,
+    response: Response,
     admin: User = Depends(require_admin),
     _master_switch: None = Depends(require_client_credentials_enabled),
     db: AsyncSession = Depends(get_db),
 ) -> ServiceAccountWithSecret:
+    _apply_no_store(response)
     rotated = await clients.rotate_secret(db, client_pk)
     if rotated is None:
         raise HTTPException(

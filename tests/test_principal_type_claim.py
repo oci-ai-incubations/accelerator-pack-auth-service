@@ -33,6 +33,24 @@ async def test_decode_token_accepts_user_token_with_principal_type(client: Async
 
 
 @pytest.mark.asyncio
+async def test_user_access_token_carries_rfc9068_typ_header(client: AsyncClient):
+    """RFC 9068 §2.1 — access tokens MUST carry ``typ: at+jwt`` in the header."""
+    payload = await _register_first_admin(client)
+    header = jwt.get_unverified_header(payload["access_token"])
+    assert header["typ"] == "at+jwt"
+
+
+@pytest.mark.asyncio
+async def test_user_access_token_carries_client_id_claim(client: AsyncClient):
+    """RFC 9068 §2.2 — access tokens carry a ``client_id`` claim. User-grant
+    tokens emit the sentinel ``user-login`` so the claim shape is uniform
+    across user and client paths."""
+    payload = await _register_first_admin(client)
+    claims = jwt.decode(payload["access_token"], options={"verify_signature": False})
+    assert claims["client_id"] == "user-login"
+
+
+@pytest.mark.asyncio
 async def test_create_client_access_token_carries_principal_type_client(db_session):
     """Direct unit test of ``create_client_access_token`` — no HTTP round trip."""
     from datetime import UTC, datetime
@@ -62,3 +80,6 @@ async def test_create_client_access_token_carries_principal_type_client(db_sessi
     assert decoded["sub"] == f"client:{account.client_id}"
     assert decoded["client_id"] == account.client_id
     assert decoded["scope"] == "cuopt.view"
+    # RFC 9068 §2.1 — client tokens MUST also carry typ: at+jwt
+    header = jwt.get_unverified_header(token)
+    assert header["typ"] == "at+jwt"

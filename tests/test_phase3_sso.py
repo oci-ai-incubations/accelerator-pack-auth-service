@@ -12,6 +12,27 @@ async def _get_admin_token(client: AsyncClient) -> str:
     return resp.json()["access_token"]
 
 
+def _oidc_config(**extra) -> dict:
+    """OIDC config with all endpoint overrides set so discovery is skipped.
+
+    Provider create/update calls ``_prefetch_oidc_discovery`` which probes
+    the issuer's ``.well-known/openid-configuration`` unless every endpoint
+    override is supplied. Tests in this module never actually exchange auth
+    codes so the override URLs can be placeholders.
+    """
+    base = {
+        "issuer": "https://idp.example.com",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "token_url": "https://idp.example.com/token",
+        "userinfo_url": "https://idp.example.com/userinfo",
+        "jwks_url": "https://idp.example.com/jwks",
+        "authorize_url": "https://idp.example.com/authorize",
+    }
+    base.update(extra)
+    return base
+
+
 # ── Provider CRUD ────────────────────────────────
 
 
@@ -24,11 +45,7 @@ async def test_create_oidc_provider(client: AsyncClient):
             "type": "oidc",
             "name": "Test OIDC",
             "slug": "test-oidc",
-            "config": {
-                "client_id": "test-client",
-                "client_secret": "test-secret",
-                "issuer": "https://idp.example.com",
-            },
+            "config": _oidc_config(),
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -61,12 +78,12 @@ async def test_create_duplicate_slug_fails(client: AsyncClient):
     token = await _get_admin_token(client)
     await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "First", "slug": "dup-slug", "config": {}},
+        json={"type": "oidc", "name": "First", "slug": "dup-slug", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     resp = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Second", "slug": "dup-slug", "config": {}},
+        json={"type": "oidc", "name": "Second", "slug": "dup-slug", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 409
@@ -77,7 +94,7 @@ async def test_list_providers(client: AsyncClient):
     token = await _get_admin_token(client)
     await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "P1", "slug": "p1", "config": {}},
+        json={"type": "oidc", "name": "P1", "slug": "p1", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     resp = await client.get("/auth/providers", headers={"Authorization": f"Bearer {token}"})
@@ -90,7 +107,7 @@ async def test_update_provider(client: AsyncClient):
     token = await _get_admin_token(client)
     create = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Old Name", "slug": "update-me", "config": {}},
+        json={"type": "oidc", "name": "Old Name", "slug": "update-me", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = create.json()["id"]
@@ -110,7 +127,7 @@ async def test_delete_provider(client: AsyncClient):
     token = await _get_admin_token(client)
     create = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Delete Me", "slug": "delete-me", "config": {}},
+        json={"type": "oidc", "name": "Delete Me", "slug": "delete-me", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = create.json()["id"]
@@ -134,7 +151,7 @@ async def test_create_and_list_claim_mapping(client: AsyncClient):
     # Create provider
     prov = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Mapper", "slug": "mapper", "config": {}},
+        json={"type": "oidc", "name": "Mapper", "slug": "mapper", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = prov.json()["id"]
@@ -170,7 +187,7 @@ async def test_delete_claim_mapping(client: AsyncClient):
 
     prov = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Del Map", "slug": "del-map", "config": {}},
+        json={"type": "oidc", "name": "Del Map", "slug": "del-map", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = prov.json()["id"]
@@ -207,7 +224,7 @@ async def test_sso_callback_creates_new_user(client: AsyncClient):
     # Create an active provider
     await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "SSO Test", "slug": "sso-test", "config": {}},
+        json={"type": "oidc", "name": "SSO Test", "slug": "sso-test", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -237,7 +254,7 @@ async def test_sso_callback_links_existing_user(client: AsyncClient):
 
     await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Link Test", "slug": "link-test", "config": {}},
+        json={"type": "oidc", "name": "Link Test", "slug": "link-test", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -276,7 +293,12 @@ async def test_sso_callback_applies_claim_mappings(client: AsyncClient):
 
     prov = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Claims Test", "slug": "claims-test", "config": {}},
+        json={
+            "type": "oidc",
+            "name": "Claims Test",
+            "slug": "claims-test",
+            "config": _oidc_config(),
+        },
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = prov.json()["id"]
@@ -330,7 +352,7 @@ async def test_sso_callback_inactive_provider_fails(client: AsyncClient):
             "type": "oidc",
             "name": "Inactive",
             "slug": "inactive",
-            "config": {},
+            "config": _oidc_config(),
             "is_active": False,
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -383,7 +405,7 @@ async def test_public_providers_returns_only_active(client: AsyncClient):
     # Create active provider
     await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Active", "slug": "active-pub", "config": {}},
+        json={"type": "oidc", "name": "Active", "slug": "active-pub", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -394,7 +416,7 @@ async def test_public_providers_returns_only_active(client: AsyncClient):
             "type": "oidc",
             "name": "Inactive",
             "slug": "inactive-pub",
-            "config": {},
+            "config": _oidc_config(),
             "is_active": False,
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -417,7 +439,7 @@ async def test_public_providers_minimal_fields(client: AsyncClient):
             "type": "oidc",
             "name": "Minimal",
             "slug": "minimal-pub",
-            "config": {"client_id": "secret-id", "client_secret": "super-secret"},
+            "config": _oidc_config(client_id="secret-id", client_secret="super-secret"),
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -443,11 +465,7 @@ async def test_sso_authorize_oidc(client: AsyncClient):
             "type": "oidc",
             "name": "OIDC Auth",
             "slug": "oidc-auth",
-            "config": {
-                "issuer": "https://idp.example.com",
-                "client_id": "test-client-id",
-                "client_secret": "test-secret",
-            },
+            "config": _oidc_config(client_id="test-client-id"),
         },
         headers={"Authorization": f"Bearer {token}"},
     )

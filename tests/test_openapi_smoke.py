@@ -27,6 +27,7 @@ PUBLIC_PATHS: set[tuple[str, str]] = {
     ("post", "/auth/oauth/token"),
     ("get", "/auth/.well-known/jwks.json"),
     ("get", "/auth/.well-known/openid-configuration"),
+    ("get", "/auth/.well-known/oauth-authorization-server"),
 }
 
 

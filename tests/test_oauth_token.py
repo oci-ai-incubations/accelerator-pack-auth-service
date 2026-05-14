@@ -453,6 +453,162 @@ async def test_token_unknown_client_pays_bcrypt_cost_for_timing_parity(client: A
 
 
 @pytest.mark.asyncio
+async def test_token_endpoint_sends_no_store_on_success(client: AsyncClient):
+    """RFC 6749 §5.1 — token-returning responses MUST carry Cache-Control: no-store."""
+    admin = await _register_admin(client)
+    sa = await _create_service_account(client, admin["access_token"], scopes=["cuopt.view"])
+    resp = await client.post(
+        "/auth/oauth/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": sa["client_id"],
+            "client_secret": sa["client_secret"],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["pragma"] == "no-cache"
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_sends_no_store_on_error(client: AsyncClient):
+    """RFC 6749 §5.1 — even invalid_client errors carry no-store / no-cache."""
+    resp = await client.post(
+        "/auth/oauth/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": "made-up",
+            "client_secret": "made-up",
+        },
+    )
+    assert resp.status_code == 401
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["pragma"] == "no-cache"
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_rejects_json_content_type(client: AsyncClient):
+    """RFC 6749 §3.2 — token endpoint requires application/x-www-form-urlencoded."""
+    resp = await client.post(
+        "/auth/oauth/token",
+        json={"grant_type": "client_credentials"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"] == "invalid_request"
+    assert "Content-Type" in body["error_description"]
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_basic_auth_failure_emits_www_authenticate(client: AsyncClient):
+    """RFC 6749 §5.2 + RFC 7235 §2.1 — invalid_client on a Basic attempt
+    returns WWW-Authenticate: Basic; form-body failures DO NOT (we never
+    attempted Basic auth)."""
+    import base64
+
+    bad_basic = base64.b64encode(b"made-up:made-up").decode()
+    resp = await client.post(
+        "/auth/oauth/token",
+        headers={"Authorization": f"Basic {bad_basic}"},
+        data={"grant_type": "client_credentials"},
+    )
+    assert resp.status_code == 401
+    challenge = resp.headers.get("www-authenticate", "")
+    assert challenge.startswith("Basic")
+    assert 'realm="auth-service"' in challenge
+    assert 'error="invalid_client"' in challenge
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_form_failure_omits_www_authenticate(client: AsyncClient):
+    """When the caller used form-body credentials, no auth scheme was attempted
+    — emitting WWW-Authenticate would prompt browsers for HTTP Basic creds
+    which is misleading. Spec: omit the header."""
+    resp = await client.post(
+        "/auth/oauth/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": "made-up",
+            "client_secret": "made-up",
+        },
+    )
+    assert resp.status_code == 401
+    assert "www-authenticate" not in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_login_sends_no_store_on_success(client: AsyncClient):
+    """RFC 6749 §5.1 — /auth/login response carries Cache-Control: no-store."""
+    await client.post(
+        "/auth/register",
+        json={"email": "no-store@cache.example.com", "password": "password123", "name": "X"},
+    )
+    resp = await client.post(
+        "/auth/login",
+        json={"email": "no-store@cache.example.com", "password": "password123"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["pragma"] == "no-cache"
+
+
+@pytest.mark.asyncio
+async def test_register_sends_no_store(client: AsyncClient):
+    """RFC 6749 §5.1 — /auth/register response carries Cache-Control: no-store."""
+    resp = await client.post(
+        "/auth/register",
+        json={
+            "email": "register-no-store@cache.example.com",
+            "password": "password123",
+            "name": "X",
+        },
+    )
+    assert resp.status_code == 201
+    assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_refresh_sends_no_store(client: AsyncClient):
+    """RFC 6749 §5.1 — /auth/refresh response carries Cache-Control: no-store."""
+    reg = await client.post(
+        "/auth/register",
+        json={"email": "refresh-ns@cache.example.com", "password": "password123", "name": "X"},
+    )
+    refresh = reg.json()["refresh_token"]
+    resp = await client.post("/auth/refresh", json={"refresh_token": refresh})
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_admin_clients_post_sends_no_store(client: AsyncClient):
+    """RFC 6749 §5.1 — admin POST /auth/admin/clients returns one-time
+    client_secret in the body; must carry no-store."""
+    admin = await _register_admin(client)
+    resp = await client.post(
+        "/auth/admin/clients",
+        headers={"Authorization": f"Bearer {admin['access_token']}"},
+        json={"name": "ns-test", "scopes": ["cuopt.view"]},
+    )
+    assert resp.status_code == 201
+    assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_admin_clients_rotate_sends_no_store(client: AsyncClient):
+    """RFC 6749 §5.1 — POST /auth/admin/clients/{id}/rotate-secret returns
+    new one-time secret; must carry no-store."""
+    admin = await _register_admin(client)
+    sa = await _create_service_account(client, admin["access_token"])
+    resp = await client.post(
+        f"/auth/admin/clients/{sa['id']}/rotate-secret",
+        headers={"Authorization": f"Bearer {admin['access_token']}"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
 async def test_token_updates_last_used_metadata(client: AsyncClient):
     admin = await _register_admin(client)
     sa = await _create_service_account(client, admin["access_token"])

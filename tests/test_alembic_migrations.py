@@ -63,9 +63,21 @@ def test_alembic_upgrade_idempotent_on_second_run(tmp_path: Path) -> None:
     command.upgrade(cfg, "head")
 
 
-@pytest.mark.parametrize("revision", ["001", "002", "003", "004", "005", "006", "007"])
+@pytest.mark.parametrize(
+    "revision", ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011"]
+)
 def test_alembic_step_upgrades(tmp_path: Path, revision: str) -> None:
     """Each intermediate revision can be reached without error."""
     db_file = tmp_path / f"alembic_step_{revision}.db"
     url = f"sqlite+aiosqlite:///{db_file}"
     command.upgrade(_alembic_config_for(url), revision)
+
+
+def test_alembic_head_creates_sso_state_table(tmp_path: Path) -> None:
+    """Migration 011 adds the sso_state table for SSO CSRF / nonce defense."""
+    db_file = tmp_path / "alembic_sso_state.db"
+    url = f"sqlite+aiosqlite:///{db_file}"
+    command.upgrade(_alembic_config_for(url), "head")
+
+    tables, _ = asyncio.run(_table_inspect(url))
+    assert "sso_state" in tables

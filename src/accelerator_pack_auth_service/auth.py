@@ -1,3 +1,18 @@
+"""Token signing, decoding, and FastAPI auth dependencies.
+
+Access tokens conform to RFC 9068 (`JWT Profile for OAuth 2.0 Access Tokens`):
+
+- The JWS header carries ``typ: "at+jwt"`` (§2.1) so consumers can reject
+  ID tokens or refresh tokens accidentally presented at API endpoints.
+- The payload carries ``client_id`` (§2.2) for both user and client tokens.
+  User tokens emit a literal sentinel ``"user-login"`` rather than the empty
+  string — RFC 9068 §2.2 says the claim ``identif[ies] the OAuth 2.0 client``,
+  so carrying an empty string would be a lie. ``"user-login"`` documents the
+  fact that the token came from a non-client grant and keeps the claim shape
+  uniform across both code paths so downstream consumers never branch on
+  presence.
+"""
+
 import hashlib
 import secrets
 import uuid
@@ -28,6 +43,18 @@ from .models import (
 from .pack_models import load_active_model
 
 security = HTTPBearer()
+
+# RFC 9068 §2.1: access tokens carry ``typ: "at+jwt"`` in the JWS header so
+# verifiers can distinguish them from ID tokens (``id+jwt``) and refresh
+# tokens. Named here so both create_*_access_token paths stay aligned.
+_ACCESS_TOKEN_TYP = "at+jwt"  # noqa: S105 — RFC 9068 typ header literal, not a credential
+
+# RFC 9068 §2.2: ``client_id`` is the OAuth 2.0 client identifier. For tokens
+# minted by the password grant via ``/auth/login`` there is no OAuth client —
+# users authenticate directly — so we emit a sentinel literal instead of an
+# empty string. ``"user-login"`` documents the provenance of the token and
+# keeps the claim shape uniform across user and client paths.
+_USER_TOKEN_CLIENT_ID = "user-login"
 
 
 def hash_password(password: str) -> str:
@@ -69,6 +96,7 @@ async def create_access_token(db: AsyncSession, user: User, scopes: list[str] | 
         "scope": " ".join(scopes),
         "type": "access",
         "principal_type": PrincipalType.user.value,
+        "client_id": _USER_TOKEN_CLIENT_ID,
         "jti": str(uuid.uuid4()),
         "iss": settings.issuer_url,
         "aud": [settings.pack],
@@ -79,7 +107,7 @@ async def create_access_token(db: AsyncSession, user: User, scopes: list[str] | 
         payload,
         signing_key.private_pem,
         algorithm="RS256",
-        headers={"kid": signing_key.kid},
+        headers={"kid": signing_key.kid, "typ": _ACCESS_TOKEN_TYP},
     )
 
 
@@ -122,7 +150,7 @@ async def create_client_access_token(
         payload,
         signing_key.private_pem,
         algorithm="RS256",
-        headers={"kid": signing_key.kid},
+        headers={"kid": signing_key.kid, "typ": _ACCESS_TOKEN_TYP},
     )
 
 

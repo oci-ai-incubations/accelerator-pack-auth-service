@@ -92,7 +92,8 @@ async def test_login_with_unallowed_scope_returns_invalid_scope(client: AsyncCli
 async def test_login_with_invalid_scope_pattern_rejected_at_validation(
     client: AsyncClient, monkeypatch
 ):
-    """Scope-string entries are per-element regex-validated by the Pydantic schema."""
+    """RFC 6749 §3.3 forbids ``"`` and ``\\`` inside scope entries — Pydantic
+    rejects at validation time before the route runs."""
     monkeypatch.setattr(settings, "pack", "cuopt")
     await _register(client, "bad-shape@scopes.example.com")
     resp = await client.post(
@@ -100,7 +101,8 @@ async def test_login_with_invalid_scope_pattern_rejected_at_validation(
         json={
             "email": "bad-shape@scopes.example.com",
             "password": "password123",
-            "scope": "has whitespace then $ymbols",
+            # `"` is forbidden VSCHAR per RFC 6749 §3.3
+            "scope": 'cuopt.solve has"quote',
         },
     )
     assert resp.status_code == 422

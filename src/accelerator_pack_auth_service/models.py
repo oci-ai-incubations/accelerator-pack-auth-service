@@ -362,6 +362,29 @@ class GroupRole(Base):
     role = relationship("DbRole")
 
 
+class SsoState(Base):
+    """Single-use SSO state token bound to a provider, redirect_uri, and nonce.
+
+    Issued at ``/auth/sso/{slug}/authorize`` and verified at the callback in
+    ``/auth/sso/{slug}/token``. Single-use semantics protect against CSRF on
+    the IdP callback (state) and OIDC ID-token replay (nonce). Expired or
+    consumed rows stay in the table for audit replay-detection until the next
+    background sweep; deletion on consume keeps the table small in the common
+    case.
+    """
+
+    __tablename__ = "sso_state"
+
+    state = Column(String(128), primary_key=True)
+    nonce = Column(String(64), nullable=False)
+    provider_id = Column(
+        Integer, ForeignKey("identity_providers.id", ondelete="CASCADE"), nullable=False
+    )
+    redirect_uri = Column(String(2048), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    expires_at = Column(DateTime, nullable=False, index=True)
+
+
 class SigningKeyStatus(enum.StrEnum):
     active = "active"
     rotating_out = "rotating_out"

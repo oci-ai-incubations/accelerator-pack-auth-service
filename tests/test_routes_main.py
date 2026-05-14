@@ -270,6 +270,9 @@ async def test_remove_unknown_role_assignment_404(client: AsyncClient):
 
 
 async def _create_oidc_provider(client: AsyncClient, admin_token: str, slug: str = "okta") -> int:
+    # All four endpoint override URLs are supplied so the auth-service skips
+    # the OIDC discovery probe at create time (tests don't exchange real
+    # codes; the discovery surface is exercised separately in test_sso_service).
     resp = await client.post(
         "/auth/providers",
         headers={"Authorization": f"Bearer {admin_token}"},
@@ -284,6 +287,7 @@ async def _create_oidc_provider(client: AsyncClient, admin_token: str, slug: str
                 "authorize_url": "https://idp.example.com/authorize",
                 "token_url": "https://idp.example.com/token",
                 "userinfo_url": "https://idp.example.com/userinfo",
+                "jwks_url": "https://idp.example.com/jwks",
                 "scope": "openid email profile",
             },
             "is_active": True,
@@ -436,17 +440,32 @@ async def test_sso_authorize_unknown_slug_404(client: AsyncClient):
 async def test_sso_token_unknown_slug_404(client: AsyncClient):
     resp = await client.post(
         "/auth/sso/nonexistent/token",
-        json={"code": "abc", "redirect_uri": "http://localhost:3000/cb"},
+        json={
+            "code": "abc",
+            "redirect_uri": "http://localhost:3000/cb",
+            "state": "any-state",
+        },
     )
     assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
 async def test_sso_token_exchange_jit_provisions(client: AsyncClient):
+    """Exchange-code → JIT path: mint state via /authorize, mock the IdP
+    exchange, and verify the user is provisioned and tokens are issued."""
     admin_token, _ = await _register_and_get_admin_token(client)
     await _create_oidc_provider(client, admin_token, slug="oidc-jit")
 
-    async def _fake_exchange(provider, code, redirect_uri):
+    auth_resp = await client.get(
+        "/auth/sso/oidc-jit/authorize",
+        params={"redirect_uri": "http://localhost:3000/cb"},
+    )
+    assert auth_resp.status_code == 200
+    state = auth_resp.json()["state"]
+
+    async def _fake_exchange(provider, code, redirect_uri, *, expected_nonce=None):
+        # The route passes the persisted nonce through to exchange — return a
+        # successfully-verified claim set as if the IdP had signed it.
         return {
             "sub": "external-123",
             "email": "ext@example.com",
@@ -459,7 +478,11 @@ async def test_sso_token_exchange_jit_provisions(client: AsyncClient):
     ):
         resp = await client.post(
             "/auth/sso/oidc-jit/token",
-            json={"code": "abc", "redirect_uri": "http://localhost:3000/cb"},
+            json={
+                "code": "abc",
+                "redirect_uri": "http://localhost:3000/cb",
+                "state": state,
+            },
         )
     assert resp.status_code == 200, resp.text
     body = resp.json()

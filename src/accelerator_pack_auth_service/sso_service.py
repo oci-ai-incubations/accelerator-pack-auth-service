@@ -1,8 +1,43 @@
-"""SSO service: JIT provisioning, claim-to-role mapping, token bridge."""
+"""SSO service: JIT provisioning, claim-to-role mapping, token bridge.
+
+Security model — what this module defends against:
+
+- **Stolen authorization code replay.** The OIDC ``state`` parameter is
+  persisted at ``/authorize`` time and consumed (deleted) on the callback so
+  an attacker who replays a victim's callback URL gets ``invalid_state``.
+- **ID-token forgery / MITM.** The IdP's ID token is signature-verified
+  against the IdP's published JWKS (RS256 by default) before any of its
+  claims are trusted. ``iss`` and ``aud`` are checked against the
+  provider's registered config. The ``userinfo`` endpoint is consulted ONLY
+  as supplemental claim enrichment; we never derive identity from a
+  signature-less HTTP response body.
+- **Nonce replay.** A fresh ``nonce`` is minted per authorize request and
+  verified to match the one inside the ID token's ``nonce`` claim — protects
+  against ID-token replay across sessions.
+
+External-identity stability — for IDCS and Entra, ``sub`` is NOT the stable
+identifier:
+
+- IDCS: ``sub`` is the user login id (changeable up to 255 ASCII chars); the
+  stable identifier is the ``user_id`` GUID claim.
+- Entra: ``sub`` is per-app pairwise; the stable identifier is the ``oid``
+  object id claim.
+- Generic OIDC: ``sub`` is stable by spec and used as the final fallback.
+
+``select_external_id`` codifies the preference order so the persisted
+``external_id`` doesn't change underneath us when the operator renames a
+user or migrates the app to a new client_id.
+"""
 
 import re
-from datetime import UTC, datetime
+import threading
+import time
+from datetime import UTC, datetime, timedelta
 
+import httpx
+import jwt
+from fastapi import HTTPException, status
+from jwt import PyJWKSet
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,9 +48,237 @@ from .models import (
     ExternalIdentity,
     IdentityProvider,
     Role,
+    SsoState,
     User,
     UserRole,
 )
+
+# Discovery cache TTL — 1 hour matches the JWKS-cache convention. Long enough
+# to keep load off the IdP, short enough that a config rotation propagates
+# within the typical incident-response window.
+_DISCOVERY_CACHE_TTL = timedelta(hours=1)
+
+# State TTL — 10 minutes per spec D2. Long enough to cover a user's IdP login
+# (including MFA prompts); short enough that a leaked state value is useless.
+_SSO_STATE_TTL = timedelta(minutes=10)
+
+# Allowable clock skew when verifying ID-token timestamps. IdP clocks drift;
+# 60s is the widely-deployed default (e.g. AWS Cognito).
+_ID_TOKEN_LEEWAY_SECONDS = 60
+
+
+_discovery_cache: dict[str, tuple[float, dict]] = {}
+_discovery_lock = threading.Lock()
+
+
+def _discovery_url(issuer: str) -> str:
+    """Build the well-known discovery URL, tolerating trailing slashes."""
+    return f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+
+
+async def discover_oidc_metadata(issuer: str) -> dict:
+    """Fetch and cache the IdP's RFC 8414 / OIDC Discovery 1.0 metadata.
+
+    Returns the parsed JSON document. Cached in-process by issuer for
+    ``_DISCOVERY_CACHE_TTL``. Raises ``HTTPException(422)`` if the document
+    is unreachable or unparseable so provider create/update returns a clear
+    "this IdP is misconfigured" signal at registration time, not first-login
+    time.
+
+    The cache is keyed by issuer (the canonical identifier in OIDC); rotating
+    a provider's IdP issuer creates a fresh cache entry naturally.
+    """
+    now = time.monotonic()
+    with _discovery_lock:
+        cached = _discovery_cache.get(issuer)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    url = _discovery_url(issuer)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"OIDC discovery fetch failed for {issuer}: {exc}",
+        ) from exc
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"OIDC discovery returned {resp.status_code} for {issuer}",
+        )
+
+    try:
+        metadata = resp.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"OIDC discovery document is not valid JSON: {exc}",
+        ) from exc
+
+    if not isinstance(metadata, dict) or "issuer" not in metadata or "jwks_uri" not in metadata:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="OIDC discovery document missing required fields (issuer, jwks_uri)",
+        )
+
+    with _discovery_lock:
+        _discovery_cache[issuer] = (now + _DISCOVERY_CACHE_TTL.total_seconds(), metadata)
+    return metadata
+
+
+def _resolve_oidc_endpoints(config: dict, discovery: dict) -> dict:
+    """Resolve the IdP endpoints from operator overrides, then discovery.
+
+    Operator-supplied keys (``token_url``, ``userinfo_url``, ``jwks_url``,
+    ``authorize_url``) take precedence so an integrator can pin a specific
+    endpoint without losing the discovery default for the others.
+    """
+    issuer = config.get("issuer", "")
+    return {
+        "token_url": config.get("token_url") or discovery.get("token_endpoint"),
+        "userinfo_url": config.get("userinfo_url") or discovery.get("userinfo_endpoint"),
+        "jwks_url": config.get("jwks_url") or discovery.get("jwks_uri"),
+        "authorize_url": config.get("authorize_url") or discovery.get("authorization_endpoint"),
+        "issuer": discovery.get("issuer") or issuer,
+        "id_token_signing_alg_values_supported": discovery.get(
+            "id_token_signing_alg_values_supported", ["RS256"]
+        ),
+    }
+
+
+# Module-level JWKS cache — one parsed PyJWKSet per jwks_url + the timestamp
+# it was fetched at. Reused across requests; refreshed when the cached entry
+# is older than _DISCOVERY_CACHE_TTL or when a kid miss demands it. Using
+# httpx (vs PyJWKClient's urllib-based fetcher) keeps the I/O path uniform
+# and lets respx-based tests stub JWKS endpoints.
+_jwks_cache: dict[str, tuple[float, PyJWKSet]] = {}
+_jwks_cache_lock = threading.Lock()
+
+
+async def _fetch_jwks(jwks_url: str) -> PyJWKSet:
+    """Fetch (or return cached) PyJWKSet for ``jwks_url``."""
+    now = time.monotonic()
+    with _jwks_cache_lock:
+        cached = _jwks_cache.get(jwks_url)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(jwks_url)
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"JWKS fetch failed ({resp.status_code}) for {jwks_url}",
+        )
+    try:
+        jwks = PyJWKSet.from_dict(resp.json())
+    except (ValueError, jwt.InvalidKeyError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid JWKS at {jwks_url}: {exc}",
+        ) from exc
+
+    with _jwks_cache_lock:
+        _jwks_cache[jwks_url] = (now + _DISCOVERY_CACHE_TTL.total_seconds(), jwks)
+    return jwks
+
+
+def _verify_id_token_with_jwks(
+    id_token: str,
+    *,
+    jwks: PyJWKSet,
+    audience: str,
+    issuer: str,
+    expected_nonce: str | None,
+    allowed_algs: list[str],
+) -> dict:
+    """Verify an IdP-issued ID token's signature and standard claims.
+
+    Threat model: a malicious or compromised network path could MITM the
+    userinfo response and inject arbitrary claims. Verifying the *signed*
+    ID token first means every claim we later trust (sub/oid/user_id, email,
+    name) is cryptographically attested by the IdP's private key.
+
+    Raises :class:`HTTPException(401)` on any failure — signature mismatch,
+    wrong issuer, wrong audience, expired token, or nonce mismatch.
+    """
+    try:
+        unverified_header = jwt.get_unverified_header(id_token)
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid ID token from IdP: {exc}",
+        ) from exc
+
+    kid = unverified_header.get("kid")
+    if not kid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="ID token missing kid header",
+        )
+
+    try:
+        signing_key = jwks[kid]
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"ID token signed by unknown key {kid}",
+        ) from exc
+
+    try:
+        claims = jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=allowed_algs,
+            audience=audience,
+            issuer=issuer,
+            leeway=_ID_TOKEN_LEEWAY_SECONDS,
+            options={
+                "verify_signature": True,
+                "verify_aud": True,
+                "verify_iss": True,
+                "verify_exp": True,
+                "verify_iat": True,
+            },
+        )
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid ID token from IdP: {exc}",
+        ) from exc
+
+    if expected_nonce is not None:
+        token_nonce = claims.get("nonce")
+        if not token_nonce or token_nonce != expected_nonce:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="ID token nonce mismatch",
+            )
+
+    return claims
+
+
+def select_external_id(claims: dict) -> str:
+    """Pick the stable external identifier from IdP claims.
+
+    Preference order:
+
+    1. ``oid`` — Microsoft Entra object id (stable across tenant, app, and
+       user-principal rename).
+    2. ``user_id`` — Oracle IDCS user GUID (stable across login-id rename).
+    3. ``sub`` — generic OIDC subject (stable per OIDC §2; safe fallback).
+
+    Returns an empty string when none of the claims is present — callers
+    should treat that as a misconfigured IdP and abort.
+    """
+    for key in ("oid", "user_id", "sub"):
+        value = claims.get(key)
+        if value:
+            return str(value)
+    return ""
 
 
 async def jit_provision_user(
@@ -143,26 +406,105 @@ async def apply_claim_mappings(
     return assigned_roles
 
 
+async def store_sso_state(
+    db: AsyncSession, *, provider_id: int, redirect_uri: str
+) -> tuple[str, str]:
+    """Mint and persist a single-use ``(state, nonce)`` pair for an authorize call.
+
+    Returns ``(state, nonce)``. The row is keyed on ``state`` (PK); the
+    nonce is round-tripped through the IdP via the ``nonce`` request
+    parameter and verified inside the ID token at callback time.
+    """
+    import secrets
+
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(16)
+    row = SsoState(
+        state=state,
+        nonce=nonce,
+        provider_id=provider_id,
+        redirect_uri=redirect_uri,
+        expires_at=datetime.now(UTC) + _SSO_STATE_TTL,
+    )
+    db.add(row)
+    await db.commit()
+    return state, nonce
+
+
+async def consume_sso_state(db: AsyncSession, *, state: str, provider_id: int) -> SsoState:
+    """Look up + delete an SSO state row; raise if missing, expired, or wrong provider.
+
+    Single-use semantics: the row is deleted on successful consume so a
+    replayed callback returns ``invalid_state`` even if it carries the
+    same state value.
+    """
+    result = await db.execute(select(SsoState).where(SsoState.state == state))
+    row = result.scalar_one_or_none()
+    if row is None or row.provider_id != provider_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_state", "error_description": "Unknown state"},
+        )
+
+    expires_at = row.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at <= datetime.now(UTC):
+        await db.delete(row)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_state", "error_description": "State expired"},
+        )
+
+    await db.delete(row)
+    await db.commit()
+    return row
+
+
 async def exchange_oidc_code(
     provider: IdentityProvider,
     code: str,
     redirect_uri: str,
+    *,
+    expected_nonce: str | None = None,
 ) -> dict:
-    """Exchange an OIDC authorization code for user info at the IdP.
+    """Exchange an OIDC authorization code at the IdP and return verified claims.
 
-    Returns a dict of claims (sub, email, name, etc.) from the ID token or userinfo.
+    Steps:
+
+    1. Resolve token / userinfo / JWKS / authorize URLs via OIDC discovery
+       (operator overrides win where set).
+    2. POST the auth code to the IdP token endpoint with our client creds.
+    3. Verify the returned ID token's signature against the IdP JWKS,
+       check ``iss``, ``aud``, ``exp``, and the ``nonce`` we minted.
+    4. Optionally enrich claims via the userinfo endpoint, but only after
+       the ID token has been cryptographically validated — the userinfo
+       response is HTTPS-only and is NOT a source of trusted identity by
+       itself.
+
+    Returns the merged claims dict for downstream JIT-provisioning.
     """
-    import httpx
-
     config = provider.config or {}
     issuer = config.get("issuer", "")
     client_id = config.get("client_id", "")
     client_secret = config.get("client_secret", "")
-    token_url = config.get("token_url", f"{issuer}/token")
-    userinfo_url = config.get("userinfo_url", f"{issuer}/userinfo")
 
-    # Exchange code for tokens
-    async with httpx.AsyncClient() as client:
+    discovery = await discover_oidc_metadata(issuer)
+    endpoints = _resolve_oidc_endpoints(config, discovery)
+    token_url = endpoints["token_url"]
+    userinfo_url = endpoints["userinfo_url"]
+    jwks_url = endpoints["jwks_url"]
+    canonical_issuer = endpoints["issuer"]
+    allowed_algs = endpoints["id_token_signing_alg_values_supported"] or ["RS256"]
+
+    if not token_url or not jwks_url:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="OIDC provider missing token_endpoint or jwks_uri",
+        )
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
         token_resp = await client.post(
             token_url,
             data={
@@ -176,37 +518,46 @@ async def exchange_oidc_code(
         )
 
         if token_resp.status_code != 200:
-            from fastapi import HTTPException, status
-
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"IdP token exchange failed: {token_resp.text}",
             )
 
         tokens = token_resp.json()
-        access_token = tokens.get("access_token", "")
+        id_token = tokens.get("id_token", "")
+        if not id_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="IdP token response missing id_token",
+            )
 
-        # Fetch user info
-        userinfo_resp = await client.get(
-            userinfo_url,
-            headers={"Authorization": f"Bearer {access_token}"},
+        jwks = await _fetch_jwks(jwks_url)
+        claims = _verify_id_token_with_jwks(
+            id_token,
+            jwks=jwks,
+            audience=client_id,
+            issuer=canonical_issuer,
+            expected_nonce=expected_nonce,
+            allowed_algs=allowed_algs,
         )
 
-        if userinfo_resp.status_code == 200:
-            return userinfo_resp.json()
+        # Optional userinfo enrichment — only AFTER the ID token has been
+        # cryptographically validated. Userinfo claims merge into the verified
+        # set but cannot override the signed identity ones.
+        if userinfo_url:
+            access_token = tokens.get("access_token", "")
+            if access_token:
+                userinfo_resp = await client.get(
+                    userinfo_url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if userinfo_resp.status_code == 200:
+                    userinfo_claims = userinfo_resp.json()
+                    if isinstance(userinfo_claims, dict):
+                        for key, value in userinfo_claims.items():
+                            claims.setdefault(key, value)
 
-        # Fallback: decode ID token claims if userinfo fails
-        id_token = tokens.get("id_token", "")
-        if id_token:
-            import json
-            from base64 import urlsafe_b64decode
-
-            payload = id_token.split(".")[1]
-            # Add padding
-            payload += "=" * (4 - len(payload) % 4)
-            return json.loads(urlsafe_b64decode(payload))
-
-        return {"sub": "unknown", "email": "", "name": "SSO User"}
+        return claims
 
 
 async def issue_sso_tokens(

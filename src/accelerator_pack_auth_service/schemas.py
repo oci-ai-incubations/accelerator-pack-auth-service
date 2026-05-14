@@ -10,9 +10,16 @@ from .models import PermissionLevel, ProviderType, Role
 # unusable on creation); 10-year ceilings prevent the year-9999 surprise that
 # Pydantic's open-ended ``datetime`` field otherwise allows.
 _SERVICE_ACCOUNT_MAX_EXPIRY = timedelta(days=3650)
-# RFC 6749 §3.3 scope-string shape: VSCHAR-ish — restrict to a safe subset
-# plus a 128-char cap so a single oversized entry can't blow up storage.
-_SCOPE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
+# RFC 6749 §3.3 scope-string VSCHAR character set: printable ASCII except
+# ``"`` (0x22) and ``\`` (0x5C). Covers the URL-shaped scopes that real-world
+# OIDC providers emit — Google ("https://www.googleapis.com/auth/userinfo.email"),
+# Oracle IDCS ("https://cuopt.example.com/api/cuopt.solve"), Microsoft Entra
+# ("access_as_user"), Auth0 ("read:users").
+_SCOPE_NAME_PATTERN = re.compile(r"^[\x21\x23-\x5B\x5D-\x7E]+$")
+# Per-entry length cap (256 chars) matches the longer URL-form scopes that
+# OIDC/IDCS emit without leaving room for a single oversized entry to blow up
+# storage or logging budgets.
+_SCOPE_NAME_MAX_LENGTH = 256
 # Caps the scopes list so an attacker can't post 100k entries and stall the
 # server during JSON-encoding + DB write.
 _SERVICE_ACCOUNT_MAX_SCOPES = 64
@@ -39,8 +46,7 @@ class LoginRequest(BaseModel):
         if v is None:
             return None
         for entry in v.split():
-            if not _SCOPE_NAME_PATTERN.fullmatch(entry):
-                raise ValueError("scope entries must match [a-zA-Z0-9._:-]{1,128} (RFC 6749 §3.3)")
+            _ensure_valid_scope_entry(entry)
         return v
 
 
@@ -224,13 +230,32 @@ class ClaimMappingResponse(BaseModel):
 
 
 # ── OAuth2 Service Accounts (Spec 002) ──────────────
+def _ensure_valid_scope_entry(entry: object) -> None:
+    """Validate a single scope-list entry against RFC 6749 §3.3 VSCHAR.
+
+    Reject empty strings, non-strings, oversized entries, and any entry
+    containing forbidden control / double-quote / backslash characters.
+    Hoisted out so ``LoginRequest.scope`` and the service-account scope-list
+    validators share one source of truth (and one consistent error message).
+    """
+    if not isinstance(entry, str):
+        raise ValueError("scope entries must be strings")
+    if not entry:
+        raise ValueError("scope entries must be non-empty")
+    if len(entry) > _SCOPE_NAME_MAX_LENGTH:
+        raise ValueError(f"scope entries must be at most {_SCOPE_NAME_MAX_LENGTH} characters")
+    if not _SCOPE_NAME_PATTERN.fullmatch(entry):
+        raise ValueError(
+            "scope entries must be RFC 6749 §3.3 VSCHAR (printable ASCII except '\"' and '\\')"
+        )
+
+
 def _validate_scope_list(scopes: list[str] | None) -> list[str] | None:
     """Reject scope entries that don't match RFC 6749 §3.3 shape + cap length."""
     if scopes is None:
         return None
     for entry in scopes:
-        if not isinstance(entry, str) or not _SCOPE_NAME_PATTERN.fullmatch(entry):
-            raise ValueError("scopes entries must match [a-zA-Z0-9._:-]{1,128} (RFC 6749 §3.3)")
+        _ensure_valid_scope_entry(entry)
     return scopes
 
 
