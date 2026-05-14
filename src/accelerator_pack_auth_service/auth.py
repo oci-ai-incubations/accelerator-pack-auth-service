@@ -15,6 +15,7 @@ from .config import settings
 from .crypto import get_active_signing_key, get_key_by_kid
 from .database import get_db
 from .models import (
+    AuditResult,
     FailedLoginAttempt,
     PrincipalType,
     RefreshToken,
@@ -38,20 +39,34 @@ def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode(), password_hash.encode())
 
 
-async def create_access_token(db: AsyncSession, user: User) -> str:
+async def create_access_token(db: AsyncSession, user: User, scopes: list[str] | None = None) -> str:
     """Mint an RS256 access token signed by the current active signing key.
 
     Takes ``db`` so the caller's session — the same one FastAPI's
     ``get_db`` dependency yields — drives the signing-key lookup. Opening a
     fresh ``async_session()`` here would bypass the test fixture override
     and read a different engine that has no signing keys.
+
+    ``scopes`` rides in the token as a space-separated ``scope`` claim per
+    RFC 6749 §3.3. When omitted, scopes are resolved via
+    :func:`resolve_principal_scopes` — user.allowed_scopes (with wildcards
+    expanded against the user's role) if set, else the active pack model's
+    role-to-permission expansion (also wildcard-expanded). Every new token
+    carries the fully-enumerated scope list; the literal ``*`` never appears
+    in the claim, so verifiers never need wildcard logic on the read path.
     """
+    from .pack_models import load_active_model
+    from .scopes import resolve_principal_scopes
+
     signing_key = await get_active_signing_key(db)
+    if scopes is None:
+        scopes = resolve_principal_scopes(user, load_active_model(settings.pack))
     payload = {
         "sub": str(user.id),
         "email": user.email,
         "role": user.role.value,
         "name": user.name,
+        "scope": " ".join(scopes),
         "type": "access",
         "principal_type": PrincipalType.user.value,
         "jti": str(uuid.uuid4()),
@@ -69,7 +84,7 @@ async def create_access_token(db: AsyncSession, user: User) -> str:
 
 
 async def create_client_access_token(
-    db: AsyncSession, client: ServiceAccount, scopes: list[str]
+    db: AsyncSession, client: ServiceAccount, scopes: list[str] | None = None
 ) -> str:
     """Mint an RS256 access token for an OAuth2 service-account principal.
 
@@ -79,8 +94,18 @@ async def create_client_access_token(
     ``role`` / ``email`` / ``name`` claims with ``client_id`` + space-joined
     ``scope``. Takes ``db`` so the caller's session — the same one FastAPI
     yields — drives the signing-key lookup.
+
+    ``scopes`` defaults to the service account's full registered set
+    (wildcard-expanded if the account was stamped with ``["*"]``) so
+    callers that don't care about per-token narrowing get the standard
+    full-grant behavior.
     """
+    from .pack_models import load_active_model
+    from .scopes import resolve_principal_scopes
+
     signing_key = await get_active_signing_key(db)
+    if scopes is None:
+        scopes = resolve_principal_scopes(client, load_active_model(settings.pack))
     payload = {
         "sub": f"client:{client.client_id}",
         "client_id": client.client_id,
@@ -267,7 +292,12 @@ def require_pack_permission(permission_codename: str):
     permission checks; use `require_permission` for resource- or grant-scoped
     checks.
 
-    `admin` role always passes (matches legacy behavior).
+    `admin` role always passes (matches legacy behavior). Tokens minted by
+    spec 003 carry an explicit ``scope`` claim, but pack-permission checks
+    deliberately consult role-permission expansion rather than the claim —
+    the source of truth for "what does this role have access to" is the
+    pack model. ``require_scope(...)`` is the per-token check; this one is
+    the per-role check, and the two compose cleanly when a route wants both.
     """
 
     async def _check(user: User = Depends(get_current_user)) -> User:
@@ -279,6 +309,60 @@ def require_pack_permission(permission_codename: str):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Missing required permission: {permission_codename}",
+            )
+        return user
+
+    return _check
+
+
+def require_scope(*required_scopes: str):
+    """Factory: dependency that enforces ALL listed scopes on the bearer token.
+
+    Reads the token's ``scope`` claim (a space-separated string per
+    RFC 6749 §3.3) and asserts every listed scope appears. Missing scopes
+    return 403 with the actually-missing set in the detail so the integrator
+    can see exactly what to fix.
+
+    Unlike :func:`require_pack_permission`, this dependency does NOT bypass
+    on admin role — admin tokens carry the fully-expanded scope claim from
+    :func:`create_access_token`, so the same check just works.
+
+    Chains through :func:`get_current_user` so ``is_active`` checks, refresh-
+    token rejection, and blacklist enforcement run before the scope check —
+    a deactivated user with a still-valid token cannot pass a scope gate.
+    Denials are audit-logged with ``AuditResult.failure`` and the missing
+    scope list so operators can spot under-privileged callers.
+    """
+
+    async def _check(
+        user: User = Depends(get_current_user),
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+        db: AsyncSession = Depends(get_db),
+    ) -> User:
+        # get_current_user has already verified the token (signature, expiry,
+        # issuer, blacklist, refresh-token rejection, is_active). Re-decoding
+        # here is the cleanest way to read the scope claim without changing
+        # the User model or threading the payload through the dep tree.
+        payload = await decode_token(db, credentials.credentials)
+        scope_claim = payload.get("scope")
+        token_scopes = set(
+            scope_claim.split() if isinstance(scope_claim, str) and scope_claim else []
+        )
+        missing = set(required_scopes) - token_scopes
+        if missing:
+            missing_joined = " ".join(sorted(missing))
+            await log_audit(
+                db,
+                user.id,
+                "scope_denied",
+                missing_joined,
+                principal_type=PrincipalType.user,
+                principal_id=str(user.id),
+                result=AuditResult.failure,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Missing required scopes: {missing_joined}",
             )
         return user
 
@@ -334,6 +418,7 @@ async def log_audit(
     *,
     principal_type: PrincipalType | str | None = None,
     principal_id: str | None = None,
+    result: AuditResult | None = None,
 ) -> None:
     """Write an audit log entry attributed to either a user or a client principal.
 
@@ -341,8 +426,14 @@ async def log_audit(
     so existing queries keep working. ``principal_type`` + ``principal_id``
     cover client-driven actions where ``user_id`` is None — the OAuth2 token
     endpoint, scheduled jobs run on behalf of a client, etc.
+
+    ``result`` defaults to ``AuditResult.success`` so existing callers behave
+    unchanged. Spec 003's scope-denied paths pass ``AuditResult.failure``
+    explicitly — we don't have a dedicated ``denied`` enum value because
+    adding one would require a DB migration plus an enum alter that some
+    targets (Oracle) don't handle cleanly.
     """
-    from .models import AuditLog, AuditResult
+    from .models import AuditLog
 
     resolved_principal_type: str | None
     if principal_type is None:
@@ -356,6 +447,8 @@ async def log_audit(
     if resolved_principal_id is None and user_id is not None:
         resolved_principal_id = str(user_id)
 
+    resolved_result = result if result is not None else AuditResult.success
+
     entry = AuditLog(
         user_id=user_id,
         action=action,
@@ -366,7 +459,7 @@ async def log_audit(
         actor_user_id=user_id,
         actor_principal_type=resolved_principal_type,
         actor_principal_id=resolved_principal_id,
-        result=AuditResult.success,
+        result=resolved_result,
         created_at=datetime.now(UTC),
     )
     db.add(entry)

@@ -56,7 +56,10 @@ def test_verify_secret_returns_false_on_malformed_hash():
 
 
 def test_serialize_deserialize_scopes_roundtrip():
-    raw = clients._serialize_scopes(["cuopt.solve", "cuopt.view"])  # noqa: SLF001
+    # serialize_scopes + deserialize_scopes live in scopes.py and are re-
+    # exported from clients.py — the round-trip pins both the public-facing
+    # alias and the underlying behavior.
+    raw = clients.serialize_scopes(["cuopt.solve", "cuopt.view"])
     assert clients.deserialize_scopes(raw) == ["cuopt.solve", "cuopt.view"]
 
 

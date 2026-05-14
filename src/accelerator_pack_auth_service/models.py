@@ -76,6 +76,11 @@ class User(Base):
     role = Column(Enum(Role), nullable=False, default=Role.pending)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    # JSON-encoded list of scope codenames. NULL means "use the role's full
+    # permission set" — the common case. Non-NULL pins this user to a narrower
+    # default scope set (rare; e.g. a power user who wants to limit their own
+    # default token blast radius). Spec 003.
+    allowed_scopes = Column(Text, nullable=True)
 
     collection_permissions = relationship(
         "CollectionPermission", back_populates="user", cascade="all, delete-orphan"

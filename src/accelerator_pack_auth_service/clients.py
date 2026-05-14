@@ -10,7 +10,6 @@ the session — opening a fresh ``async_session()`` here would bypass the
 FastAPI test override and read a different engine.
 """
 
-import json
 import secrets
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -21,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
 from .models import ServiceAccount
+from .scopes import deserialize_scopes, serialize_scopes
 
 # Prefixes per OWASP API Security recommendations: make credentials
 # self-identifying so leak scanners can pattern-match them on disclosure.
@@ -100,21 +100,6 @@ def verify_secret(plain: str, hashed: str) -> bool:
         return False
 
 
-def _serialize_scopes(scopes: list[str]) -> str:
-    return json.dumps(list(scopes))
-
-
-def deserialize_scopes(raw: str | None) -> list[str]:
-    """Decode the JSON-encoded scopes column back into a list."""
-    if not raw:
-        return []
-    try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    return [str(s) for s in decoded] if isinstance(decoded, list) else []
-
-
 async def create_client(
     db: AsyncSession,
     *,
@@ -137,7 +122,7 @@ async def create_client(
         client_secret_hash=hash_secret(plaintext_secret),
         name=name,
         description=description,
-        scopes=_serialize_scopes(scopes),
+        scopes=serialize_scopes(scopes),
         owner_user_id=owner_id,
         is_active=True,
         expires_at=expires_at,
@@ -215,7 +200,7 @@ async def update_client(
     if not isinstance(description, _Unset):
         account.description = description
     if scopes is not None:
-        account.scopes = _serialize_scopes(scopes)
+        account.scopes = serialize_scopes(scopes)
     if not isinstance(expires_at, _Unset):
         account.expires_at = expires_at
     if is_active is not None:

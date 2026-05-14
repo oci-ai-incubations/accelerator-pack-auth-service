@@ -28,6 +28,20 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
+    # Optional RFC 6749 §3.3 space-separated scope request. Caps the string
+    # at 2048 chars so a single oversized payload can't blow up logging /
+    # storage; each parsed entry is then per-element regex-validated below.
+    scope: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope_string(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        for entry in v.split():
+            if not _SCOPE_NAME_PATTERN.fullmatch(entry):
+                raise ValueError("scope entries must match [a-zA-Z0-9._:-]{1,128} (RFC 6749 §3.3)")
+        return v
 
 
 class TokenResponse(BaseModel):
@@ -305,3 +319,18 @@ class ServiceAccountWithSecret(ServiceAccountResponse):
     """One-time view returned by create + rotate. ``client_secret`` is plaintext."""
 
     client_secret: str
+
+
+# ── Pack Scopes (Spec 003) ──────────────────────────
+class ScopeDescription(BaseModel):
+    """One scope entry returned by GET /auth/scopes — codename + human description."""
+
+    codename: str
+    description: str
+
+
+class PackScopesResponse(BaseModel):
+    """Response shape for GET /auth/scopes — drives admin-UI scope pickers."""
+
+    pack_id: str
+    scopes: list[ScopeDescription]

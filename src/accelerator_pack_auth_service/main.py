@@ -44,6 +44,7 @@ from .crypto import (
 )
 from .database import get_db, init_db
 from .models import (
+    AuditResult,
     ClaimRoleMapping,
     CollectionPermission,
     DbRole,
@@ -57,6 +58,7 @@ from .models import (
     User,
     UserRole,
 )
+from .pack_models import load_active_model
 from .schemas import (
     ClaimMappingCreate,
     ClaimMappingResponse,
@@ -64,6 +66,7 @@ from .schemas import (
     CollectionPermissionResponse,
     LoginRequest,
     MyCollectionAccess,
+    PackScopesResponse,
     PermissionCheck,
     PermissionCheckResult,
     PermissionResponse,
@@ -77,6 +80,7 @@ from .schemas import (
     RolePermissionUpdate,
     RoleResponse,
     RoleUpdate,
+    ScopeDescription,
     ServiceAccountCreate,
     ServiceAccountResponse,
     ServiceAccountUpdate,
@@ -87,6 +91,7 @@ from .schemas import (
     UserRoleAssign,
     UserRoleResponse,
 )
+from .scopes import InvalidScopeError, grant_scopes, parse_scope_string, resolve_principal_scopes
 
 # RFC 6749 §5.2 error codes for the OAuth2 token endpoint. Named here as a
 # constant so route handlers never construct error bodies inline (drift risk
@@ -158,6 +163,10 @@ OPENAPI_TAGS = [
     {
         "name": "Service Accounts",
         "description": "Admin CRUD + secret rotation for OAuth2 client_credentials principals.",
+    },
+    {
+        "name": "Scopes",
+        "description": "Active pack's scope vocabulary for admin UI scope pickers.",
     },
 ]
 
@@ -334,9 +343,43 @@ async def get_pack_model() -> dict:
     permissions the deployment supports so admin UIs can render only the
     relevant tabs.
     """
-    from .pack_models import load_active_model
-
     return load_active_model(settings.pack).model_dump()
+
+
+@app.get(
+    "/auth/scopes",
+    response_model=PackScopesResponse,
+    summary="Get the active pack's scope vocabulary",
+    description=(
+        "Return every scope codename declared by the active pack model with "
+        "its human-readable description. Drives the admin UI's scope picker "
+        "(service-account creation, scoped user-token issuance). "
+        "Authenticated — any logged-in principal can read; the contents "
+        "aren't sensitive but anonymous discovery would let a scanner profile "
+        "the deployment surface."
+    ),
+    tags=["Scopes"],
+    responses={
+        200: {"description": "Pack scope vocabulary"},
+        401: {"description": "Token missing or invalid"},
+    },
+)
+async def get_pack_scopes(_user: User = Depends(get_current_user)) -> PackScopesResponse:
+    """Return the active pack model's scope codenames with descriptions.
+
+    Sources the human-readable description from
+    ``permission_service.PERMISSION_DESCRIPTIONS`` when available and falls
+    back to ``Permission <codename>`` otherwise — the same convention as the
+    seeding code so admin-UI labels match what's in the DB.
+    """
+    from .permission_service import _permission_meta
+
+    pack_model = load_active_model(settings.pack)
+    entries = [
+        ScopeDescription(codename=codename, description=_permission_meta(codename)[0])
+        for codename in pack_model.permissions
+    ]
+    return PackScopesResponse(pack_id=pack_model.pack_id, scopes=entries)
 
 
 # ── OIDC Discovery & JWKS ────────────────────────
@@ -440,6 +483,10 @@ async def register(request: Request, req: RegisterRequest, db: AsyncSession = De
     await db.refresh(user)
 
     await enforce_session_limit(db, user.id)
+    # No scope-request shape on register — defer to the user's full role
+    # expansion so the freshly-minted token can do everything the role
+    # allows. Issuers that want narrower default-scope tokens for new users
+    # can pin via the per-user ``allowed_scopes`` override after creation.
     access_token = await create_access_token(db, user)
     refresh_value = create_refresh_token_value()
     await store_refresh_token(db, user.id, refresh_value)
@@ -490,11 +537,46 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
     await clear_failed_attempts(db, req.email)
     await enforce_session_limit(db, user.id)
 
-    access_token = await create_access_token(db, user)
+    granted_scopes = await _grant_user_scopes(db, user, req.scope)
+    access_token = await create_access_token(db, user, scopes=granted_scopes)
     refresh_value = create_refresh_token_value()
     await store_refresh_token(db, user.id, refresh_value)
 
     return _build_token_response(access_token, refresh_value, user)
+
+
+async def _grant_user_scopes(
+    db: AsyncSession, user: User, requested_scope: str | None
+) -> list[str]:
+    """Resolve allowed-vs-requested scopes and raise OAuth2-shaped 400 on mismatch.
+
+    Used by ``/auth/login``. Register and refresh always default-resolve via
+    ``create_access_token`` and never narrow per-request — spec 003 doesn't
+    define a scope parameter on those routes.
+
+    A denial path writes an audit log with ``AuditResult.failure`` and the
+    offending requested scope string so operators can spot integrators
+    requesting scopes their role can't ever grant.
+    """
+    pack_model = load_active_model(settings.pack)
+    allowed = resolve_principal_scopes(user, pack_model)
+    requested = parse_scope_string(requested_scope)
+    try:
+        return grant_scopes(allowed, requested, strict=settings.strict_scopes)
+    except InvalidScopeError as exc:
+        await log_audit(
+            db,
+            user.id,
+            "login_invalid_scope",
+            requested_scope or "",
+            principal_type=PrincipalType.user,
+            principal_id=str(user.id),
+            result=AuditResult.failure,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": OAUTH2_ERROR_INVALID_SCOPE, "error_description": str(exc)},
+        ) from exc
 
 
 @app.post(
@@ -2615,19 +2697,22 @@ async def oauth_token(
         return invalid_client_response
 
     allowed_scopes = clients.deserialize_scopes(account.scopes)
-    if scope:
-        requested = [s for s in scope.split() if s]
-        for s in requested:
-            if s not in allowed_scopes:
-                return _oauth2_error(
-                    OAUTH2_ERROR_INVALID_SCOPE,
-                    f"Scope '{s}' is not granted to this client",
-                )
-        issued_scopes = requested
-    else:
-        # RFC 6749 §3.3: when the client omits scope, the server may issue
-        # the client's full registered scope set. That's our chosen behavior.
-        issued_scopes = allowed_scopes
+    requested_scopes = parse_scope_string(scope)
+    try:
+        issued_scopes = grant_scopes(
+            allowed_scopes, requested_scopes, strict=settings.strict_scopes
+        )
+    except InvalidScopeError as exc:
+        await log_audit(
+            db,
+            None,
+            "oauth_token_invalid_scope",
+            scope or "",
+            principal_type=PrincipalType.client,
+            principal_id=account.client_id,
+            result=AuditResult.failure,
+        )
+        return _oauth2_error(OAUTH2_ERROR_INVALID_SCOPE, str(exc))
 
     token = await create_client_access_token(db, account, issued_scopes)
     ip = request.client.host if request.client else None

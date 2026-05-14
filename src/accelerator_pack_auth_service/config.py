@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     # OAuth2 client_credentials grant. Master switch lets ops disable the
     # entire flow if a deployment doesn't issue service accounts.
     client_credentials_enabled: bool = True
+    # Strict scope-grant mode (spec 003). RFC 6749 §3.3 defaults to lenient:
+    # when a request asks for a partially-allowed set, the server issues a
+    # token covering the intersection. Flipping this to true rejects the
+    # whole request with ``invalid_scope`` instead — useful for integrators
+    # who prefer loud failures over silently-narrower tokens. Default
+    # lenient because that's the RFC default and what most clients expect.
+    strict_scopes: bool = False
     # Client tokens are typically longer-lived than user access tokens —
     # clients re-fetch using the same credentials with no human in the loop.
     client_token_expire_minutes: int = 60

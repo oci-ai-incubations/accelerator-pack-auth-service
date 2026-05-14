@@ -213,7 +213,13 @@ async def issue_sso_tokens(
     db: AsyncSession,
     user: User,
 ) -> tuple[str, str]:
-    """Issue internal JWT tokens after SSO authentication."""
+    """Issue internal JWT tokens after SSO authentication.
+
+    Scopes default-resolve from the user's role expansion (or
+    ``allowed_scopes`` override if set) per spec 003. SSO callers can't
+    request a narrower per-token scope today — the IdP callback is a coarse
+    login flow, not an OAuth2 grant.
+    """
     access_token = await create_access_token(db, user)
     refresh_value = create_refresh_token_value()
     await store_refresh_token(db, user.id, refresh_value)
