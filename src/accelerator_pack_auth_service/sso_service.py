@@ -29,10 +29,13 @@ identifier:
 user or migrates the app to a new client_id.
 """
 
+import hashlib
+import logging
 import re
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
 import httpx
 import jwt
@@ -52,6 +55,29 @@ from .models import (
     User,
     UserRole,
 )
+
+_logger = logging.getLogger(__name__)
+
+
+def _require_https(url: str, label: str) -> None:
+    """Reject IdP endpoint URLs that don't use HTTPS.
+
+    OIDC discovery responses, operator overrides, and (downstream of those)
+    JWKS / token endpoints all flow through this helper before any GET or
+    POST. A spoofed or misconfigured discovery doc could otherwise direct
+    fetches at ``http://169.254.169.254/...`` (cloud instance metadata) or
+    at an internal HTTP-only service, leaking IAM credentials or facilitating
+    SSRF. We allow only ``https://``; the cuopt-BE jwks fetcher has an
+    ``http://``-allowed override for in-cluster reachability, but the
+    auth-service contacts external IdPs and never needs HTTP.
+    """
+    scheme = urlsplit(url).scheme.lower() if url else ""
+    if scheme != "https":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"OIDC {label} must use https:// (got {scheme or 'empty'})",
+        )
+
 
 # Discovery cache TTL — 1 hour matches the JWKS-cache convention. Long enough
 # to keep load off the IdP, short enough that a config rotation propagates
@@ -135,9 +161,11 @@ def _resolve_oidc_endpoints(config: dict, discovery: dict) -> dict:
     Operator-supplied keys (``token_url``, ``userinfo_url``, ``jwks_url``,
     ``authorize_url``) take precedence so an integrator can pin a specific
     endpoint without losing the discovery default for the others.
+
+    Each resolved URL is required to use HTTPS — see ``_require_https``.
     """
     issuer = config.get("issuer", "")
-    return {
+    resolved = {
         "token_url": config.get("token_url") or discovery.get("token_endpoint"),
         "userinfo_url": config.get("userinfo_url") or discovery.get("userinfo_endpoint"),
         "jwks_url": config.get("jwks_url") or discovery.get("jwks_uri"),
@@ -147,6 +175,10 @@ def _resolve_oidc_endpoints(config: dict, discovery: dict) -> dict:
             "id_token_signing_alg_values_supported", ["RS256"]
         ),
     }
+    for key in ("token_url", "userinfo_url", "jwks_url", "authorize_url"):
+        if resolved[key]:
+            _require_https(resolved[key], key)
+    return resolved
 
 
 # Module-level JWKS cache — one parsed PyJWKSet per jwks_url + the timestamp
@@ -158,12 +190,15 @@ _jwks_cache: dict[str, tuple[float, PyJWKSet]] = {}
 _jwks_cache_lock = threading.Lock()
 
 
-# Client-credentials token cache — one bearer per (token_url, client_id) +
-# the absolute monotonic time it expires. Used as the OAuth fallback path
-# when an IdP's JWKS endpoint is admin-gated (e.g. OCI IAM Identity Domains
-# expose ``jwks_uri`` at ``/admin/v1/SigningCert/jwk``, which rejects
+# Client-credentials token cache — one bearer per
+# ``(token_url, client_id, client_secret_hash)`` + the absolute monotonic
+# time it expires. Including the secret hash in the cache key means that a
+# secret rotation invalidates the cached token automatically; the old key
+# is simply never looked up again. Used as the OAuth fallback path when an
+# IdP's JWKS endpoint is admin-gated (e.g. OCI IAM Identity Domains expose
+# ``jwks_uri`` at ``/admin/v1/SigningCert/jwk``, which rejects
 # unauthenticated GETs).
-_cc_token_cache: dict[tuple[str, str], tuple[float, str]] = {}
+_cc_token_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
 _cc_token_cache_lock = threading.Lock()
 
 
@@ -189,10 +224,15 @@ async def _client_credentials_token(
     """Fetch (or return cached) a ``client_credentials`` bearer token.
 
     Used only as a fallback when the IdP gates its JWKS endpoint behind
-    OAuth. The token is cached per ``(token_url, client_id)`` until
-    ``_CC_TOKEN_REFRESH_MARGIN`` seconds before the IdP-reported ``expires_in``.
+    OAuth. The token is cached per
+    ``(token_url, client_id, hash(client_secret))`` so a secret rotation
+    naturally invalidates the cached entry. The cache holds the token until
+    ``_CC_TOKEN_REFRESH_MARGIN`` seconds before the IdP-reported
+    ``expires_in``; tokens whose advertised lifetime is shorter than the
+    margin are used once but not cached.
     """
-    cache_key = (token_url, client_id)
+    secret_hash = hashlib.sha256(client_secret.encode("utf-8")).hexdigest()
+    cache_key = (token_url, client_id, secret_hash)
     now = time.monotonic()
     with _cc_token_cache_lock:
         cached = _cc_token_cache.get(cache_key)
@@ -211,33 +251,48 @@ async def _client_credentials_token(
             headers={"Accept": "application/json"},
         )
     if resp.status_code != 200:
+        # Log the full IdP response server-side; return a generic detail to
+        # the caller so we don't echo arbitrary IdP error bodies (which may
+        # include internal hostnames, request IDs, or tenant info) back over
+        # the public ingress.
+        _logger.warning(
+            "Client-credentials token fetch failed: status=%s url=%s body=%s",
+            resp.status_code,
+            token_url,
+            resp.text[:500],
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=(
-                f"Client-credentials token fetch failed ({resp.status_code}) "
-                f"at {token_url}: {resp.text}"
-            ),
+            detail=f"Client-credentials token fetch failed ({resp.status_code})",
         )
 
     try:
         payload = resp.json()
     except ValueError as exc:
+        _logger.warning("Client-credentials response not JSON: url=%s", token_url)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Client-credentials response at {token_url} was not JSON",
+            detail="Client-credentials response was not JSON",
         ) from exc
 
     access_token = payload.get("access_token")
     if not access_token:
+        _logger.warning("Client-credentials response missing access_token: url=%s", token_url)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Client-credentials response at {token_url} missing access_token",
+            detail="Client-credentials response missing access_token",
         )
 
     expires_in = int(payload.get("expires_in", 300))
-    ttl = max(expires_in - _CC_TOKEN_REFRESH_MARGIN, 30)
-    with _cc_token_cache_lock:
-        _cc_token_cache[cache_key] = (now + ttl, access_token)
+    # If the IdP-reported lifetime is shorter than the refresh margin, the
+    # math ``expires_in - margin`` is negative and clamping to a fixed floor
+    # would cache the token *longer* than the IdP says it's valid. In that
+    # case skip the cache entirely — return the token to the current caller,
+    # let the next caller fetch a fresh one.
+    if expires_in > _CC_TOKEN_REFRESH_MARGIN:
+        ttl = expires_in - _CC_TOKEN_REFRESH_MARGIN
+        with _cc_token_cache_lock:
+            _cc_token_cache[cache_key] = (now + ttl, access_token)
     return access_token
 
 
@@ -275,16 +330,25 @@ async def _fetch_jwks(
             )
 
     if resp.status_code != 200:
+        # Log the full URL server-side; return a generic detail to the
+        # caller so we don't echo internal admin endpoints (IDCS exposes
+        # JWKS at /admin/v1/SigningCert/jwk) back through public errors.
+        _logger.warning(
+            "JWKS fetch failed: status=%s url=%s",
+            resp.status_code,
+            jwks_url,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"JWKS fetch failed ({resp.status_code}) for {jwks_url}",
+            detail=f"JWKS fetch failed ({resp.status_code})",
         )
     try:
         jwks = PyJWKSet.from_dict(resp.json())
     except (ValueError, jwt.InvalidKeyError) as exc:
+        _logger.warning("Invalid JWKS payload: url=%s err=%s", jwks_url, exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid JWKS at {jwks_url}: {exc}",
+            detail="Invalid JWKS payload from IdP",
         ) from exc
 
     with _jwks_cache_lock:

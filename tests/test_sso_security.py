@@ -584,3 +584,189 @@ async def test_client_credentials_token_missing_access_token_raises(respx_mock):
             IDP_TOKEN_URL, IDP_CLIENT_ID, IDP_CLIENT_SECRET, None
         )
     assert "missing access_token" in exc_info.value.detail
+
+
+# ── Hardening wave regressions ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_fetch_jwks_error_does_not_leak_url(respx_mock):
+    """The JWKS fetch error detail must not echo the (possibly admin-gated)
+    internal URL back to the caller — the URL is logged server-side only."""
+    from fastapi import HTTPException
+
+    _reset_jwks_caches()
+    respx_mock.get(IDP_JWKS_URL).mock(return_value=httpx.Response(500))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sso_service._fetch_jwks(IDP_JWKS_URL)
+    assert exc_info.value.status_code == 401
+    assert IDP_JWKS_URL not in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_cc_token_error_does_not_leak_idp_response(respx_mock):
+    """CC-token error detail must not echo the IdP's response body."""
+    from fastapi import HTTPException
+
+    _reset_jwks_caches()
+    respx_mock.post(IDP_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            401,
+            json={"error": "unauthorized_client", "internal_request_id": "leak-me-x9z"},
+        )
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sso_service._client_credentials_token(
+            IDP_TOKEN_URL, IDP_CLIENT_ID, IDP_CLIENT_SECRET, None
+        )
+    assert "leak-me-x9z" not in exc_info.value.detail
+    assert "unauthorized_client" not in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_cc_token_cache_key_includes_secret_hash(respx_mock):
+    """Rotating the client_secret must force a fresh CC token fetch even when
+    the same (token_url, client_id) pair is reused."""
+    _reset_jwks_caches()
+    token_route = respx_mock.post(IDP_TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+    )
+
+    await sso_service._client_credentials_token(IDP_TOKEN_URL, IDP_CLIENT_ID, "old-secret", None)
+    await sso_service._client_credentials_token(IDP_TOKEN_URL, IDP_CLIENT_ID, "new-secret", None)
+
+    assert token_route.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cc_token_ttl_floor_skips_cache_when_lifetime_under_margin(respx_mock):
+    """If the IdP says the token lives for less than the refresh margin, the
+    cache must not hold it (otherwise we'd return a stale/expired token on
+    the next call)."""
+    _reset_jwks_caches()
+    token_route = respx_mock.post(IDP_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "short-lived", "expires_in": 10},
+        )
+    )
+
+    first = await sso_service._client_credentials_token(
+        IDP_TOKEN_URL, IDP_CLIENT_ID, IDP_CLIENT_SECRET, None
+    )
+    second = await sso_service._client_credentials_token(
+        IDP_TOKEN_URL, IDP_CLIENT_ID, IDP_CLIENT_SECRET, None
+    )
+
+    assert first == second == "short-lived"
+    assert token_route.call_count == 2  # not cached — fetched twice
+
+
+@pytest.mark.asyncio
+async def test_resolve_oidc_endpoints_rejects_http_scheme():
+    """Operator-supplied or discovery-supplied non-HTTPS endpoint URLs must
+    be rejected so a spoofed discovery doc can't direct fetches at
+    http://169.254.169.254/... (cloud instance metadata) or internal HTTP
+    services."""
+    from fastapi import HTTPException
+
+    discovery = {
+        "issuer": "https://idp.test",
+        "token_endpoint": "http://idp.test/oauth/token",  # http:// — rejected
+        "userinfo_endpoint": "https://idp.test/userinfo",
+        "jwks_uri": "https://idp.test/jwks",
+        "authorization_endpoint": "https://idp.test/authorize",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        sso_service._resolve_oidc_endpoints({"issuer": "https://idp.test"}, discovery)
+    assert exc_info.value.status_code == 422
+    assert "https://" in exc_info.value.detail or "must use https" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_resolve_oidc_endpoints_rejects_file_scheme_in_config():
+    """Operator-pinned endpoint URLs go through the same scheme allowlist."""
+    from fastapi import HTTPException
+
+    config = {
+        "issuer": "https://idp.test",
+        "jwks_url": "file:///etc/passwd",  # file:// — rejected
+    }
+    discovery = {
+        "issuer": "https://idp.test",
+        "token_endpoint": "https://idp.test/token",
+        "authorization_endpoint": "https://idp.test/authorize",
+        "jwks_uri": "https://idp.test/jwks",
+        "userinfo_endpoint": "https://idp.test/userinfo",
+    }
+
+    with pytest.raises(HTTPException):
+        sso_service._resolve_oidc_endpoints(config, discovery)
+
+
+@pytest.mark.asyncio
+async def test_authorize_rejects_redirect_uri_outside_allowlist(client: AsyncClient):
+    """When AUTH_SSO_REDIRECT_BASE_URL is set, /authorize must reject a
+    redirect_uri that doesn't match {base}/sso/callback/{slug}."""
+    from unittest.mock import patch
+
+    from accelerator_pack_auth_service.config import settings
+
+    _reset_sso_caches()
+    admin_token = await _register_admin(client)
+    await _create_provider(client, admin_token, slug="allowlist-test")
+
+    with patch.object(settings, "sso_redirect_base_url", "https://pack.example.com"):
+        # Wrong host
+        resp = await client.get(
+            "/auth/sso/allowlist-test/authorize",
+            params={"redirect_uri": "https://attacker.example.com/sso/callback/allowlist-test"},
+        )
+        assert resp.status_code == 400
+        # Wrong slug
+        resp = await client.get(
+            "/auth/sso/allowlist-test/authorize",
+            params={"redirect_uri": "https://pack.example.com/sso/callback/other-slug"},
+        )
+        assert resp.status_code == 400
+        # Exact match passes
+        resp = await client.get(
+            "/auth/sso/allowlist-test/authorize",
+            params={"redirect_uri": "https://pack.example.com/sso/callback/allowlist-test"},
+        )
+        assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_token_exchange_rejects_redirect_uri_mismatch(
+    client: AsyncClient, db_session, respx_mock
+):
+    """/token must reject when the presented redirect_uri doesn't match the
+    one stored against the state row at /authorize time."""
+    _reset_sso_caches()
+    admin_token = await _register_admin(client)
+    await _create_provider(client, admin_token, slug="redir-mismatch")
+
+    state = await _authorize(client, "redir-mismatch")
+    private_pem, public_jwk, kid = _mint_idp_keypair()
+    from sqlalchemy import select
+
+    from accelerator_pack_auth_service.models import SsoState
+
+    row = (await db_session.execute(select(SsoState).where(SsoState.state == state))).scalar_one()
+    id_token = _make_id_token(private_pem, kid, nonce=row.nonce)
+    _mock_idp(respx_mock, public_jwk=public_jwk, id_token=id_token)
+
+    resp = await client.post(
+        "/auth/sso/redir-mismatch/token",
+        json={
+            "code": "c",
+            "redirect_uri": "http://localhost:3000/different-cb",
+            "state": state,
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["error"] == "invalid_state"

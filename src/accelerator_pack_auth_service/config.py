@@ -48,9 +48,26 @@ class Settings(BaseSettings):
 
     # Security
     bcrypt_rounds: int = 12
-    cors_origins: str = "*"  # comma-separated; set to specific origins in prod
+    # Comma-separated list of allowed CORS origins. Fail-closed default —
+    # operators must explicitly enumerate trusted origins (matches the
+    # pack-BE convention; AUTH_CORS_ORIGINS is plumbed from TF in
+    # ai-accelerator-starter-packs/auth-locals.tf). A wildcard is detected
+    # at middleware setup and forces allow_credentials=False to satisfy
+    # the CORS spec.
+    cors_origins: str = ""
+    # When false, emit production security headers (HSTS, etc.) and disable
+    # OpenAPI doc surfaces per security-standards.md. When true (dev),
+    # suppress HSTS so a self-signed cluster cert doesn't pin the browser
+    # into refusing the host on the next visit.
+    debug: bool = False
     rate_limit_login: str = "10/minute"
     rate_limit_register: str = "5/minute"
+    # Refresh tokens and SSO callback exchanges are the post-login
+    # equivalent of /login — protect them at the same rate.
+    rate_limit_refresh: str = "10/minute"
+    rate_limit_sso_token: str = "10/minute"
+    rate_limit_audit: str = "20/minute"
+    rate_limit_audit_export: str = "5/minute"
     # OAuth2 token endpoint is a favored credential-stuffing target — stricter
     # per-IP limit than other authenticated endpoints. Per-client limits
     # belong in spec 003 / a follow-up.

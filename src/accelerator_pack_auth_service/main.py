@@ -8,7 +8,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
-from slowapi import Limiter
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -216,6 +218,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.state.limiter = limiter
+# Wire the slowapi exception handler + middleware. Without these, raising
+# RateLimitExceeded bubbles up as a generic 500 (we'd be back-off-blind),
+# and routes lacking an explicit @limiter.limit decorator would have no
+# per-IP cap at all. The handler emits a clean 429 with a Retry-After.
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 
 def custom_openapi() -> dict:
@@ -255,14 +263,21 @@ def custom_openapi() -> dict:
 
 app.openapi = custom_openapi
 
-# CORS — configurable via AUTH_CORS_ORIGINS
+# CORS — configurable via AUTH_CORS_ORIGINS (comma-separated). Default is
+# empty (no cross-origin requests permitted) — operators must explicitly
+# allowlist the pack frontend's origin. If a wildcard "*" appears in the
+# list we force allow_credentials=False per the CORS spec (Starlette would
+# silently fail to echo Access-Control-Allow-Credentials in that case;
+# being explicit makes the intent visible). Methods and headers are
+# enumerated rather than wildcarded.
 origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+_cors_has_wildcard = "*" in origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=not _cors_has_wildcard,
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -280,7 +295,13 @@ async def security_headers(request: Request, call_next):
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
     )
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # HSTS pins the host to HTTPS for max-age, with no user override path —
+    # gate on production mode (AUTH_DEBUG=false). Demo clusters with
+    # self-signed certs hit by HSTS-pinned browsers become unreachable
+    # without clearing chrome://net-internals/#hsts state. Production
+    # deployments with valid certs DO want HSTS; the gate is the standard.
+    if not settings.debug:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
@@ -671,7 +692,9 @@ async def _grant_user_scopes(
     },
     openapi_extra={"security": []},
 )
+@limiter.limit(settings.rate_limit_refresh)
 async def refresh_token(
+    request: Request,
     req: RefreshRequest,
     response: Response,
     db: AsyncSession = Depends(get_db),
@@ -718,6 +741,7 @@ async def refresh_token(
         401: {"description": "Access token missing or invalid"},
     },
 )
+@limiter.limit(settings.rate_limit_refresh)
 async def logout(
     request: Request,
     user: User = Depends(get_current_user),
@@ -1868,6 +1892,22 @@ async def sso_authorize(
     if not provider:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
 
+    # Defense in depth on top of the IdP-side Redirect URL allowlist: when
+    # AUTH_SSO_REDIRECT_BASE_URL is set, require the caller's redirect_uri
+    # to be exactly {base}/sso/callback/{slug}. The IdP's allowlist is
+    # authoritative; this check just refuses to mint state for callbacks
+    # that we know are bound to fail at the IdP anyway, and tightens the
+    # surface against open-redirect-style attacks if an operator
+    # misconfigures the IdP's allowlist (e.g. wildcards a domain).
+    base = settings.sso_redirect_base_url.rstrip("/") if settings.sso_redirect_base_url else ""
+    if base:
+        expected_redirect = f"{base}/sso/callback/{slug}"
+        if redirect_uri != expected_redirect:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"redirect_uri must equal {expected_redirect}",
+            )
+
     config = provider.config or {}
     state, nonce = await store_sso_state(db, provider_id=provider.id, redirect_uri=redirect_uri)
 
@@ -1931,6 +1971,7 @@ async def sso_authorize(
     },
     openapi_extra={"security": []},
 )
+@limiter.limit(settings.rate_limit_sso_token)
 async def sso_token_exchange(
     slug: str,
     request: Request,
@@ -1977,6 +2018,16 @@ async def sso_token_exchange(
     # downstream IdP exchange succeeds — a leaked state is useless after one
     # attempt, replay attempts return invalid_state.
     state_row = await consume_sso_state(db, state=state, provider_id=provider.id)
+
+    # The redirect_uri presented at /token must match the one we minted state
+    # against at /authorize. Refuses mid-flight redirect-URI substitution and
+    # ensures the IdP's token-endpoint redirect_uri parameter (which OIDC
+    # requires to equal the authorize-time value) matches what we stored.
+    if redirect_uri != state_row.redirect_uri:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_state", "error_description": "redirect_uri mismatch"},
+        )
 
     user_info = await exchange_oidc_code(
         provider,
@@ -2536,6 +2587,7 @@ async def scim_delete_group(
         403: {"description": "Caller lacks `admin.audit.view`"},
     },
 )
+@limiter.limit(settings.rate_limit_audit)
 async def query_audit(
     request: Request,
     _user: User = Depends(require_pack_permission("admin.audit.view")),
@@ -2577,7 +2629,9 @@ async def query_audit(
         403: {"description": "Caller lacks `admin.audit.view`"},
     },
 )
+@limiter.limit(settings.rate_limit_audit_export)
 async def export_audit(
+    request: Request,
     _user: User = Depends(require_pack_permission("admin.audit.view")),
     db: AsyncSession = Depends(get_db),
 ):
