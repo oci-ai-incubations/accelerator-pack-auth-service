@@ -22,13 +22,9 @@ def upgrade() -> None:
     existing_cols = {col["name"] for col in inspector.get_columns("audit_logs")}
 
     if "actor_principal_type" not in existing_cols:
-        op.add_column(
-            "audit_logs", sa.Column("actor_principal_type", sa.String(16), nullable=True)
-        )
+        op.add_column("audit_logs", sa.Column("actor_principal_type", sa.String(16), nullable=True))
     if "actor_principal_id" not in existing_cols:
-        op.add_column(
-            "audit_logs", sa.Column("actor_principal_id", sa.String(128), nullable=True)
-        )
+        op.add_column("audit_logs", sa.Column("actor_principal_id", sa.String(128), nullable=True))
 
 
 def downgrade() -> None:

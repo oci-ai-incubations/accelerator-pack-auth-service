@@ -43,9 +43,7 @@ def upgrade() -> None:
         sa.Column("last_used_at", sa.DateTime, nullable=True),
         sa.Column("last_used_ip", sa.String(45), nullable=True),
     )
-    op.create_index(
-        "ix_service_accounts_client_id", "service_accounts", ["client_id"], unique=True
-    )
+    op.create_index("ix_service_accounts_client_id", "service_accounts", ["client_id"], unique=True)
     op.create_index("ix_service_accounts_owner_user_id", "service_accounts", ["owner_user_id"])
 
 
