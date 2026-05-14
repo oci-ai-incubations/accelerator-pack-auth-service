@@ -20,7 +20,6 @@ PUBLIC_PATHS: set[tuple[str, str]] = {
     ("post", "/auth/register"),
     ("post", "/auth/login"),
     ("post", "/auth/refresh"),
-    ("post", "/auth/sso/callback"),
     ("get", "/auth/sso/providers"),
     ("get", "/auth/sso/{slug}/authorize"),
     ("post", "/auth/sso/{slug}/token"),

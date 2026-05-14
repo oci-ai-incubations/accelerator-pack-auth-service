@@ -109,7 +109,9 @@ Key settings:
 | GET/PATCH/DELETE | `/auth/providers/{id}` | Admin | CRUD |
 | GET/POST | `/auth/providers/{id}/mappings` | Admin | Claim mappings |
 | DELETE | `/auth/providers/{id}/mappings/{mid}` | Admin | Delete mapping |
-| POST | `/auth/sso/callback` | No | SSO callback (JIT provision) |
+| GET | `/auth/sso/providers` | No | List public SSO providers |
+| GET | `/auth/sso/{slug}/authorize` | No | Build IdP authorize URL + state |
+| POST | `/auth/sso/{slug}/token` | No | Exchange IdP auth code for internal tokens |
 
 ### Groups (Phase 4)
 | Method | Path | Auth | Description |

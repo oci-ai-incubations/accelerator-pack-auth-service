@@ -1790,73 +1790,17 @@ async def delete_claim_mapping(
     await log_audit(db, admin.id, "delete_claim_mapping", f"mapping={mapping_id}")
 
 
-# ── SSO Callback (Phase 3) ───────────────────────
-
-
-@app.post(
-    "/auth/sso/callback",
-    response_model=TokenResponse,
-    summary="SSO callback (internal handoff)",
-    description=(
-        "Generic SSO callback invoked by OIDC/SAML handlers after the "
-        "external assertion has been validated. JIT-provisions the user, "
-        "applies claim→role mappings, and returns an internal token pair. "
-        "Public (no auth) but expects a pre-validated payload — production "
-        "deployments call this internally from the OIDC callback / SAML ACS."
-    ),
-    tags=["SSO"],
-    responses={
-        200: {"description": "Token pair issued for the SSO user"},
-        400: {"description": "Missing `provider_slug` in request body"},
-        404: {"description": "Provider not found or inactive"},
-    },
-    openapi_extra={"security": []},
-)
-async def sso_callback(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-):
-    """Generic SSO callback — called by OIDC/SAML handlers after external auth.
-
-    Expects JSON body with: provider_slug, external_id, email, name, claims.
-    In production, the OIDC callback and SAML ACS endpoints validate the
-    external token/assertion and then call this internally.
-    """
-    body = await request.json()
-    slug = body.get("provider_slug")
-    if not slug:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="provider_slug required"
-        )
-
-    result = await db.execute(
-        select(IdentityProvider).where(
-            IdentityProvider.slug == slug, IdentityProvider.is_active == 1
-        )
-    )
-    provider = result.scalar_one_or_none()
-    if not provider:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
-
-    from .sso_service import apply_claim_mappings, issue_sso_tokens, jit_provision_user
-
-    user, _created = await jit_provision_user(
-        db,
-        provider,
-        external_id=body.get("external_id", ""),
-        email=body.get("email", ""),
-        name=body.get("name", "SSO User"),
-        raw_claims=body.get("claims"),
-    )
-
-    claims = body.get("claims", {})
-    await apply_claim_mappings(db, provider, user, claims)
-
-    access_token, refresh_value = await issue_sso_tokens(db, user)
-    return _build_token_response(access_token, refresh_value, user)
-
-
 # ── SSO Public Discovery & OIDC Flow ─────────────
+#
+# (Note: the Phase 3 placeholder route POST /auth/sso/callback was removed —
+#  it accepted an unauthenticated JSON body containing arbitrary email +
+#  claims and minted tokens via JIT. The canonical OIDC callback path is
+#  POST /auth/sso/{slug}/token below, which exchanges the IdP code, verifies
+#  the ID-token signature against the IdP's JWKS, validates iss/aud/exp/nonce,
+#  and only then JIT-provisions and issues tokens. SAML support, when added,
+#  must replicate that signature-verification posture before calling
+#  jit_provision_user; do not reintroduce an unauthenticated "trust-the-body"
+#  shortcut.)
 
 
 @app.get(
