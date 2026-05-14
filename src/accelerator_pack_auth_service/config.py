@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     cors_origins: str = "*"  # comma-separated; set to specific origins in prod
     rate_limit_login: str = "10/minute"
     rate_limit_register: str = "5/minute"
+    # OAuth2 token endpoint is a favored credential-stuffing target — stricter
+    # per-IP limit than other authenticated endpoints. Per-client limits
+    # belong in spec 003 / a follow-up.
+    rate_limit_oauth_token: str = "60/minute"
+
+    # OAuth2 client_credentials grant. Master switch lets ops disable the
+    # entire flow if a deployment doesn't issue service accounts.
+    client_credentials_enabled: bool = True
+    # Client tokens are typically longer-lived than user access tokens —
+    # clients re-fetch using the same credentials with no human in the loop.
+    client_token_expire_minutes: int = 60
+    # Soft cap on service accounts per owner — prevents accidental sprawl.
+    client_max_per_owner: int = 20
     account_lockout_threshold: int = 5
     account_lockout_duration_minutes: int = 30
     max_concurrent_sessions: int = 5

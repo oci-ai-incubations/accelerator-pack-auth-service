@@ -47,6 +47,19 @@ class Role(enum.StrEnum):
     pending = "pending"
 
 
+class PrincipalType(enum.StrEnum):
+    """Discriminator for the JWT ``principal_type`` claim.
+
+    Separates human callers (``user`` — fronted by login + refresh tokens) from
+    machine callers (``client`` — OAuth2 client_credentials grant). Pack BEs
+    branch on this when distinguishing role-gated routes (humans only) from
+    scope-gated routes (either).
+    """
+
+    user = "user"
+    client = "client"
+
+
 class PermissionLevel(enum.StrEnum):
     read = "read"
     write = "write"
@@ -382,6 +395,11 @@ class AuditLog(Base):
     event_type = Column(String(100), nullable=False, index=True)
     actor_user_id = Column(Integer, nullable=True)
     actor_email = Column(String(320), nullable=True)
+    # Principal-typed actor fields supersede actor_user_id for client-driven
+    # actions. actor_user_id stays populated for user-typed actors so existing
+    # queries / dashboards keep working without an immediate migration.
+    actor_principal_type = Column(String(16), nullable=True)
+    actor_principal_id = Column(String(128), nullable=True)
     target_type = Column(String(100), nullable=True)
     target_id = Column(String(255), nullable=True)
     tenant_id = Column(Integer, nullable=True)
@@ -395,3 +413,31 @@ class AuditLog(Base):
     target = Column(String(255), nullable=True)
     detail = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=True, default=lambda: datetime.now(UTC))
+
+
+class ServiceAccount(Base):
+    """OAuth2 client_credentials principal — machine-to-machine identity.
+
+    Created by an admin via the /auth/admin/clients API; authenticated against
+    the token endpoint with a bcrypt-hashed shared secret. The plaintext
+    secret is shown exactly once at creation (or rotation) and is never
+    persisted. Tokens minted for this account carry ``principal_type=client``
+    and ``sub=client:<client_id>``.
+    """
+
+    __tablename__ = "service_accounts"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    client_id = Column(String(64), unique=True, nullable=False, index=True)
+    client_secret_hash = Column(String(128), nullable=False)
+    name = Column(String(128), nullable=False)
+    description = Column(Text, nullable=True)
+    # JSON-encoded list of scope codenames. Empty string = no scopes granted.
+    scopes = Column(Text, nullable=False, default="")
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    revoked_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+    last_used_ip = Column(String(45), nullable=True)

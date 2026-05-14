@@ -1,0 +1,64 @@
+"""User + client tokens both carry ``principal_type``; decode_token returns it."""
+
+import jwt
+import pytest
+from httpx import AsyncClient
+
+from accelerator_pack_auth_service import auth, clients
+from accelerator_pack_auth_service.models import Role, User
+
+
+async def _register_first_admin(client: AsyncClient) -> dict:
+    resp = await client.post(
+        "/auth/register",
+        json={"email": "first@principal.example.com", "password": "password123", "name": "First"},
+    )
+    assert resp.status_code == 201
+    return resp.json()
+
+
+@pytest.mark.asyncio
+async def test_user_access_token_carries_principal_type_user(client: AsyncClient):
+    payload = await _register_first_admin(client)
+    claims = jwt.decode(payload["access_token"], options={"verify_signature": False})
+    assert claims["principal_type"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_decode_token_accepts_user_token_with_principal_type(client: AsyncClient, db_session):
+    payload = await _register_first_admin(client)
+    decoded = await auth.decode_token(db_session, payload["access_token"])
+    assert decoded["principal_type"] == "user"
+    assert decoded["sub"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_create_client_access_token_carries_principal_type_client(db_session):
+    """Direct unit test of ``create_client_access_token`` — no HTTP round trip."""
+    from datetime import UTC, datetime
+
+    owner = User(
+        email="o@principal.example.com",
+        name="O",
+        password_hash="x",
+        role=Role.admin,
+        is_active=True,
+        created_at=datetime.now(UTC),
+    )
+    db_session.add(owner)
+    await db_session.commit()
+    await db_session.refresh(owner)
+    account, _ = await clients.create_client(
+        db_session,
+        owner_id=owner.id,
+        name="x",
+        description=None,
+        scopes=["cuopt.view"],
+        expires_at=None,
+    )
+    token = await auth.create_client_access_token(db_session, account, ["cuopt.view"])
+    decoded = await auth.decode_token(db_session, token)
+    assert decoded["principal_type"] == "client"
+    assert decoded["sub"] == f"client:{account.client_id}"
+    assert decoded["client_id"] == account.client_id
+    assert decoded["scope"] == "cuopt.view"

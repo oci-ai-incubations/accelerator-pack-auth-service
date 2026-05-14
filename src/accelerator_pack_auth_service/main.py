@@ -1,21 +1,25 @@
+import base64
+import binascii
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import __version__, scim_service
+from . import __version__, clients, scim_service
 from .auth import (
     blacklist_token,
     check_account_lockout,
     clear_failed_attempts,
     create_access_token,
+    create_client_access_token,
     create_refresh_token_value,
     decode_token,
     enforce_session_limit,
@@ -45,8 +49,10 @@ from .models import (
     DbRole,
     IdentityProvider,
     Permission,
+    PrincipalType,
     Role,
     RolePermission,
+    ServiceAccount,
     SigningKey,
     User,
     UserRole,
@@ -71,12 +77,25 @@ from .schemas import (
     RolePermissionUpdate,
     RoleResponse,
     RoleUpdate,
+    ServiceAccountCreate,
+    ServiceAccountResponse,
+    ServiceAccountUpdate,
+    ServiceAccountWithSecret,
     TokenResponse,
     UpdateUserRequest,
     UserResponse,
     UserRoleAssign,
     UserRoleResponse,
 )
+
+# RFC 6749 §5.2 error codes for the OAuth2 token endpoint. Named here as a
+# constant so route handlers never construct error bodies inline (drift risk
+# on per-error error_description strings is the silent-correctness hazard the
+# RFC was built to prevent).
+OAUTH2_ERROR_INVALID_CLIENT = "invalid_client"
+OAUTH2_ERROR_INVALID_REQUEST = "invalid_request"
+OAUTH2_ERROR_UNSUPPORTED_GRANT_TYPE = "unsupported_grant_type"
+OAUTH2_ERROR_INVALID_SCOPE = "invalid_scope"
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -131,6 +150,14 @@ OPENAPI_TAGS = [
     {
         "name": "Signing Keys",
         "description": "RS256 signing-key lifecycle: list, rotate, revoke (admin).",
+    },
+    {
+        "name": "OAuth2",
+        "description": "RFC 6749 token endpoints (client_credentials grant).",
+    },
+    {
+        "name": "Service Accounts",
+        "description": "Admin CRUD + secret rotation for OAuth2 client_credentials principals.",
     },
 ]
 
@@ -2449,6 +2476,420 @@ async def admin_status(
             "groups": group_count,
         },
     }
+
+
+# ── OAuth2 / Service Accounts (Spec 002) ─────────
+
+
+def _oauth2_error(
+    error: str,
+    description: str,
+    *,
+    http_status: int = status.HTTP_400_BAD_REQUEST,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    """Build an RFC 6749 §5.2-shaped error response.
+
+    Callers return the response directly — raising HTTPException would bury
+    the OAuth2 error fields under the FastAPI ``{"detail": ...}`` envelope
+    that integrators don't expect on the token endpoint.
+    """
+    body: dict[str, str] = {"error": error, "error_description": description}
+    return JSONResponse(status_code=http_status, content=body, headers=headers)
+
+
+def _parse_basic_auth(header: str | None) -> tuple[str, str] | None:
+    """Decode an HTTP Basic ``Authorization: Basic ...`` header.
+
+    Returns ``(client_id, client_secret)`` on success or ``None`` when the
+    header is absent or malformed. The token endpoint translates ``None`` plus
+    missing form credentials into ``invalid_client`` — never raise here.
+    """
+    if not header:
+        return None
+    scheme, _, encoded = header.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded.strip(), validate=True).decode()
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    if ":" not in decoded:
+        return None
+    client_id, _, client_secret = decoded.partition(":")
+    return client_id, client_secret
+
+
+@app.post(
+    "/auth/oauth/token",
+    summary="OAuth2 token endpoint (client_credentials grant)",
+    description=(
+        "RFC 6749 §4.4 client_credentials grant. Issues an RS256 access token "
+        "for an authenticated service account. Credentials may be supplied "
+        "via HTTP Basic auth OR the form body — providing both returns "
+        "`invalid_request`. The path lives under `/auth/` because the auth-"
+        "service is reachable only through the pack frontend's `/auth/*` "
+        "ingress prefix. Public — no existing bearer token required."
+    ),
+    tags=["OAuth2"],
+    responses={
+        200: {"description": "Access token issued"},
+        400: {
+            "description": (
+                "Malformed request, unsupported grant (including when the master "
+                "switch is off), or invalid scope"
+            ),
+        },
+        401: {"description": "Invalid or unauthorized client credentials"},
+        429: {"description": "Token endpoint rate limit exceeded"},
+    },
+    openapi_extra={"security": []},
+)
+@limiter.limit(settings.rate_limit_oauth_token)
+async def oauth_token(
+    request: Request,
+    grant_type: str = Form(...),
+    client_id: str | None = Form(None),
+    client_secret: str | None = Form(None),
+    scope: str | None = Form(None),
+    db: AsyncSession = Depends(get_db),
+):
+    if not settings.client_credentials_enabled:
+        # RFC 6749 §5.2 maps ``unsupported_grant_type`` to HTTP 400. 503
+        # implied "transient" — but the master switch is an intentional ops
+        # decision, so the 400 path is the standards-compliant choice.
+        return _oauth2_error(
+            OAUTH2_ERROR_UNSUPPORTED_GRANT_TYPE,
+            "client_credentials grant is disabled",
+        )
+
+    if grant_type != "client_credentials":
+        return _oauth2_error(
+            OAUTH2_ERROR_UNSUPPORTED_GRANT_TYPE,
+            "Only client_credentials is supported",
+        )
+
+    basic_credentials = _parse_basic_auth(request.headers.get("authorization"))
+    form_has_credentials = client_id is not None or client_secret is not None
+
+    if basic_credentials is not None and form_has_credentials:
+        # Per RFC 6749 §2.3.1, clients MUST NOT use more than one
+        # authentication method in each request.
+        return _oauth2_error(
+            OAUTH2_ERROR_INVALID_REQUEST,
+            "Use either HTTP Basic or form-body credentials, not both",
+        )
+
+    if basic_credentials is not None:
+        presented_client_id, presented_client_secret = basic_credentials
+    else:
+        presented_client_id = client_id or ""
+        presented_client_secret = client_secret or ""
+
+    # Same response shape for every credential failure to prevent enumeration
+    # — RFC 6749 §5.2 invalid_client carries 401 + WWW-Authenticate per spec.
+    invalid_client_response = _oauth2_error(
+        OAUTH2_ERROR_INVALID_CLIENT,
+        "Client authentication failed",
+        http_status=status.HTTP_401_UNAUTHORIZED,
+        headers={"WWW-Authenticate": "Basic"},
+    )
+
+    if not presented_client_id or not presented_client_secret:
+        # Pay the bcrypt cost even on missing credentials so the response time
+        # is indistinguishable from an unknown-client lookup (timing parity
+        # with the verify_secret branch below).
+        clients.verify_secret(presented_client_secret, clients.get_dummy_bcrypt_hash())
+        return invalid_client_response
+
+    account = await clients.get_client_by_client_id(db, presented_client_id)
+    if account is None:
+        # Pay the bcrypt cost on the unknown-client branch — otherwise an
+        # attacker can time-correlate the response and enumerate valid
+        # client_ids (~250ms parity gap at bcrypt rounds=12).
+        clients.verify_secret(presented_client_secret, clients.get_dummy_bcrypt_hash())
+        return invalid_client_response
+    if not clients.verify_secret(presented_client_secret, account.client_secret_hash):
+        return invalid_client_response
+    if not clients.is_client_usable(account):
+        return invalid_client_response
+
+    allowed_scopes = clients.deserialize_scopes(account.scopes)
+    if scope:
+        requested = [s for s in scope.split() if s]
+        for s in requested:
+            if s not in allowed_scopes:
+                return _oauth2_error(
+                    OAUTH2_ERROR_INVALID_SCOPE,
+                    f"Scope '{s}' is not granted to this client",
+                )
+        issued_scopes = requested
+    else:
+        # RFC 6749 §3.3: when the client omits scope, the server may issue
+        # the client's full registered scope set. That's our chosen behavior.
+        issued_scopes = allowed_scopes
+
+    token = await create_client_access_token(db, account, issued_scopes)
+    ip = request.client.host if request.client else None
+    await clients.update_last_used(db, account.client_id, ip)
+    await log_audit(
+        db,
+        None,
+        "oauth_token_issued",
+        f"client={account.client_id}",
+        principal_type=PrincipalType.client,
+        principal_id=account.client_id,
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": settings.client_token_expire_minutes * 60,
+        "scope": " ".join(issued_scopes),
+    }
+
+
+def _service_account_response(account: ServiceAccount) -> ServiceAccountResponse:
+    return ServiceAccountResponse.model_validate(clients.service_account_to_dict(account))
+
+
+def _service_account_with_secret(
+    account: ServiceAccount, plaintext: str
+) -> ServiceAccountWithSecret:
+    return ServiceAccountWithSecret.model_validate(
+        clients.service_account_to_dict(account, plaintext=plaintext)
+    )
+
+
+def require_client_credentials_enabled() -> None:
+    """Block admin CRUD when ``AUTH_CLIENT_CREDENTIALS_ENABLED=false``.
+
+    Spec 002 promises that the master switch turns the feature off "entirely"
+    — gating only the token endpoint would let admins keep registering
+    accounts that no one can ever exchange for a token. 503 here matches the
+    pre-fix token-endpoint code: this is admin surface (not RFC-shaped), so
+    a transient-style 503 is the more honest signal.
+    """
+    if not settings.client_credentials_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="client_credentials grant is disabled (AUTH_CLIENT_CREDENTIALS_ENABLED=false)",
+        )
+
+
+@app.post(
+    "/auth/admin/clients",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ServiceAccountWithSecret,
+    summary="Create a service account",
+    description=(
+        "Register a new OAuth2 client_credentials principal owned by the "
+        "calling admin. The response includes a one-time-visible "
+        "`client_secret` — store it now, the server can't show it again. "
+        "Admin only."
+    ),
+    tags=["Service Accounts"],
+    responses={
+        201: {"description": "Service account created with one-time-visible secret"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        409: {"description": "Per-owner client limit reached"},
+        422: {"description": "Validation error on the request body"},
+        503: {"description": "Client-credentials grant disabled (master switch off)"},
+    },
+)
+async def create_service_account_endpoint(
+    req: ServiceAccountCreate,
+    admin: User = Depends(require_admin),
+    _master_switch: None = Depends(require_client_credentials_enabled),
+    db: AsyncSession = Depends(get_db),
+) -> ServiceAccountWithSecret:
+    existing = await clients.count_clients_for_owner(db, admin.id)
+    if existing >= settings.client_max_per_owner:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Per-owner client limit reached ({settings.client_max_per_owner})",
+        )
+
+    account, plaintext = await clients.create_client(
+        db,
+        owner_id=admin.id,
+        name=req.name,
+        description=req.description,
+        scopes=req.scopes,
+        expires_at=req.expires_at,
+    )
+    await log_audit(db, admin.id, "create_service_account", f"client={account.client_id}")
+    return _service_account_with_secret(account, plaintext)
+
+
+@app.get(
+    "/auth/admin/clients",
+    response_model=list[ServiceAccountResponse],
+    summary="List service accounts",
+    description=(
+        "Admin sees every service account across all owners; non-admin "
+        "callers see only their own. Both views are newest first. Admin only."
+    ),
+    tags=["Service Accounts"],
+    responses={
+        200: {"description": "List of service accounts (secrets never included)"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        503: {"description": "Client-credentials grant disabled (master switch off)"},
+    },
+)
+async def list_service_accounts_endpoint(
+    _admin: User = Depends(require_admin),
+    _master_switch: None = Depends(require_client_credentials_enabled),
+    db: AsyncSession = Depends(get_db),
+) -> list[ServiceAccountResponse]:
+    accounts = await clients.list_all_clients(db)
+    return [_service_account_response(a) for a in accounts]
+
+
+@app.get(
+    "/auth/admin/clients/{client_pk}",
+    response_model=ServiceAccountResponse,
+    summary="Get a service account",
+    description="Return a service account by primary key. Secret is never included. Admin only.",
+    tags=["Service Accounts"],
+    responses={
+        200: {"description": "Service account detail"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Service account not found"},
+        503: {"description": "Client-credentials grant disabled (master switch off)"},
+    },
+)
+async def get_service_account_endpoint(
+    client_pk: int,
+    _admin: User = Depends(require_admin),
+    _master_switch: None = Depends(require_client_credentials_enabled),
+    db: AsyncSession = Depends(get_db),
+) -> ServiceAccountResponse:
+    account = await clients.get_client_by_id(db, client_pk)
+    if account is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service account not found"
+        )
+    return _service_account_response(account)
+
+
+@app.patch(
+    "/auth/admin/clients/{client_pk}",
+    response_model=ServiceAccountResponse,
+    summary="Update a service account",
+    description=(
+        "Patch a service account's name, description, scopes, expiry, or "
+        "active flag. Setting `is_active=false` stamps `revoked_at` if it "
+        "wasn't already set. Audit-logged. Admin only."
+    ),
+    tags=["Service Accounts"],
+    responses={
+        200: {"description": "Updated service account"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Service account not found"},
+        422: {"description": "Validation error on the request body"},
+        503: {"description": "Client-credentials grant disabled (master switch off)"},
+    },
+)
+async def update_service_account_endpoint(
+    client_pk: int,
+    req: ServiceAccountUpdate,
+    admin: User = Depends(require_admin),
+    _master_switch: None = Depends(require_client_credentials_enabled),
+    db: AsyncSession = Depends(get_db),
+) -> ServiceAccountResponse:
+    # Pydantic ``model_fields_set`` distinguishes "field omitted" from
+    # "field explicitly set to None" so the sentinel-based update_client can
+    # clear nullable columns when the admin sends an explicit ``null``.
+    sent = req.model_fields_set
+    kwargs: dict[str, Any] = {}
+    if "name" in sent:
+        kwargs["name"] = req.name
+    if "description" in sent:
+        kwargs["description"] = req.description
+    if "scopes" in sent:
+        kwargs["scopes"] = req.scopes
+    if "expires_at" in sent:
+        kwargs["expires_at"] = req.expires_at
+    if "is_active" in sent:
+        kwargs["is_active"] = req.is_active
+
+    account = await clients.update_client(db, client_pk, **kwargs)
+    if account is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service account not found"
+        )
+    await log_audit(db, admin.id, "update_service_account", f"client={account.client_id}")
+    return _service_account_response(account)
+
+
+@app.post(
+    "/auth/admin/clients/{client_pk}/rotate-secret",
+    response_model=ServiceAccountWithSecret,
+    summary="Rotate a service account's secret",
+    description=(
+        "Mint a new client_secret and return it once. The previous secret "
+        "stops working immediately; the client_id stays the same so "
+        "consumers only need to update one value. Audit-logged. Admin only."
+    ),
+    tags=["Service Accounts"],
+    responses={
+        200: {"description": "New one-time-visible client_secret"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Service account not found"},
+        503: {"description": "Client-credentials grant disabled (master switch off)"},
+    },
+)
+async def rotate_service_account_secret_endpoint(
+    client_pk: int,
+    admin: User = Depends(require_admin),
+    _master_switch: None = Depends(require_client_credentials_enabled),
+    db: AsyncSession = Depends(get_db),
+) -> ServiceAccountWithSecret:
+    rotated = await clients.rotate_secret(db, client_pk)
+    if rotated is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service account not found"
+        )
+    account, plaintext = rotated
+    await log_audit(db, admin.id, "rotate_service_account", f"client={account.client_id}")
+    return _service_account_with_secret(account, plaintext)
+
+
+@app.delete(
+    "/auth/admin/clients/{client_pk}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a service account",
+    description=(
+        "Soft-delete: sets `is_active=false` and stamps `revoked_at`. The "
+        "row remains for audit attribution. Audit-logged. Admin only."
+    ),
+    tags=["Service Accounts"],
+    responses={
+        204: {"description": "Service account revoked"},
+        401: {"description": "Token missing or invalid"},
+        403: {"description": "Caller is not an admin"},
+        404: {"description": "Service account not found"},
+        503: {"description": "Client-credentials grant disabled (master switch off)"},
+    },
+)
+async def revoke_service_account_endpoint(
+    client_pk: int,
+    admin: User = Depends(require_admin),
+    _master_switch: None = Depends(require_client_credentials_enabled),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    account = await clients.revoke_client(db, client_pk)
+    if account is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service account not found"
+        )
+    await log_audit(db, admin.id, "revoke_service_account", f"client={account.client_id}")
 
 
 # ── Signing Keys (admin) ─────────────────────────

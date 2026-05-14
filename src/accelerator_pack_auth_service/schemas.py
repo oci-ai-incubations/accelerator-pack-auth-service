@@ -1,8 +1,21 @@
-from datetime import datetime
+import re
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from .models import PermissionLevel, ProviderType, Role
+
+# Service-account expiry caps. Past dates are nonsensical (the client would be
+# unusable on creation); 10-year ceilings prevent the year-9999 surprise that
+# Pydantic's open-ended ``datetime`` field otherwise allows.
+_SERVICE_ACCOUNT_MAX_EXPIRY = timedelta(days=3650)
+# RFC 6749 §3.3 scope-string shape: VSCHAR-ish — restrict to a safe subset
+# plus a 128-char cap so a single oversized entry can't blow up storage.
+_SCOPE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
+# Caps the scopes list so an attacker can't post 100k entries and stall the
+# server during JSON-encoding + DB write.
+_SERVICE_ACCOUNT_MAX_SCOPES = 64
 
 
 # ── Auth ──────────────────────────────────────────
@@ -194,3 +207,101 @@ class ClaimMappingResponse(BaseModel):
     is_regex: bool
 
     model_config = {"from_attributes": True}
+
+
+# ── OAuth2 Service Accounts (Spec 002) ──────────────
+def _validate_scope_list(scopes: list[str] | None) -> list[str] | None:
+    """Reject scope entries that don't match RFC 6749 §3.3 shape + cap length."""
+    if scopes is None:
+        return None
+    for entry in scopes:
+        if not isinstance(entry, str) or not _SCOPE_NAME_PATTERN.fullmatch(entry):
+            raise ValueError("scopes entries must match [a-zA-Z0-9._:-]{1,128} (RFC 6749 §3.3)")
+    return scopes
+
+
+def _normalize_expires_at(value: Any) -> Any:
+    """Coerce naive datetimes to UTC so downstream comparisons stay timezone-aware."""
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
+def _validate_expires_at_window(value: datetime | None) -> datetime | None:
+    """Reject past dates and dates more than 10 years in the future."""
+    if value is None:
+        return None
+    now = datetime.now(UTC)
+    if value < now:
+        raise ValueError("expires_at must be in the future")
+    if value > now + _SERVICE_ACCOUNT_MAX_EXPIRY:
+        raise ValueError("expires_at must be within 10 years")
+    return value
+
+
+class ServiceAccountCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=2000)
+    scopes: list[str] = Field(default_factory=list, max_length=_SERVICE_ACCOUNT_MAX_SCOPES)
+    expires_at: datetime | None = None
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, v: list[str]) -> list[str]:
+        return _validate_scope_list(v) or []
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def _coerce_naive_expires_at(cls, v: Any) -> Any:
+        return _normalize_expires_at(v)
+
+    @field_validator("expires_at")
+    @classmethod
+    def _check_expires_at_window(cls, v: datetime | None) -> datetime | None:
+        return _validate_expires_at_window(v)
+
+
+class ServiceAccountUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=2000)
+    scopes: list[str] | None = Field(default=None, max_length=_SERVICE_ACCOUNT_MAX_SCOPES)
+    expires_at: datetime | None = None
+    is_active: bool | None = None
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, v: list[str] | None) -> list[str] | None:
+        return _validate_scope_list(v)
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def _coerce_naive_expires_at(cls, v: Any) -> Any:
+        return _normalize_expires_at(v)
+
+    @field_validator("expires_at")
+    @classmethod
+    def _check_expires_at_window(cls, v: datetime | None) -> datetime | None:
+        return _validate_expires_at_window(v)
+
+
+class ServiceAccountResponse(BaseModel):
+    """Read-side view of a service account — secret never included."""
+
+    id: int
+    client_id: str
+    name: str
+    description: str | None
+    scopes: list[str]
+    owner_user_id: int
+    is_active: bool
+    expires_at: datetime | None
+    created_at: datetime
+    revoked_at: datetime | None
+    last_used_at: datetime | None
+    last_used_ip: str | None
+
+
+class ServiceAccountWithSecret(ServiceAccountResponse):
+    """One-time view returned by create + rotate. ``client_secret`` is plaintext."""
+
+    client_secret: str

@@ -14,7 +14,16 @@ from . import crypto
 from .config import settings
 from .crypto import get_active_signing_key, get_key_by_kid
 from .database import get_db
-from .models import FailedLoginAttempt, RefreshToken, Role, SigningKeyStatus, TokenBlacklist, User
+from .models import (
+    FailedLoginAttempt,
+    PrincipalType,
+    RefreshToken,
+    Role,
+    ServiceAccount,
+    SigningKeyStatus,
+    TokenBlacklist,
+    User,
+)
 from .pack_models import load_active_model
 
 security = HTTPBearer()
@@ -44,10 +53,44 @@ async def create_access_token(db: AsyncSession, user: User) -> str:
         "role": user.role.value,
         "name": user.name,
         "type": "access",
+        "principal_type": PrincipalType.user.value,
         "jti": str(uuid.uuid4()),
         "iss": settings.issuer_url,
         "aud": [settings.pack],
         "exp": datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes),
+        "iat": datetime.now(UTC),
+    }
+    return jwt.encode(
+        payload,
+        signing_key.private_pem,
+        algorithm="RS256",
+        headers={"kid": signing_key.kid},
+    )
+
+
+async def create_client_access_token(
+    db: AsyncSession, client: ServiceAccount, scopes: list[str]
+) -> str:
+    """Mint an RS256 access token for an OAuth2 service-account principal.
+
+    Mirrors ``create_access_token`` (same signing-key resolution, same
+    audience, same issuer) but stamps ``principal_type=client``, prefixes
+    ``sub`` with ``client:`` to avoid collision with user IDs, and substitutes
+    ``role`` / ``email`` / ``name`` claims with ``client_id`` + space-joined
+    ``scope``. Takes ``db`` so the caller's session — the same one FastAPI
+    yields — drives the signing-key lookup.
+    """
+    signing_key = await get_active_signing_key(db)
+    payload = {
+        "sub": f"client:{client.client_id}",
+        "client_id": client.client_id,
+        "scope": " ".join(scopes),
+        "type": "access",
+        "principal_type": PrincipalType.client.value,
+        "jti": str(uuid.uuid4()),
+        "iss": settings.issuer_url,
+        "aud": [settings.pack],
+        "exp": datetime.now(UTC) + timedelta(minutes=settings.client_token_expire_minutes),
         "iat": datetime.now(UTC),
     }
     return jwt.encode(
@@ -283,8 +326,35 @@ async def enforce_session_limit(db: AsyncSession, user_id: int) -> None:
         await db.commit()
 
 
-async def log_audit(db: AsyncSession, user_id: int, action: str, target: str = "") -> None:
+async def log_audit(
+    db: AsyncSession,
+    user_id: int | None,
+    action: str,
+    target: str = "",
+    *,
+    principal_type: PrincipalType | str | None = None,
+    principal_id: str | None = None,
+) -> None:
+    """Write an audit log entry attributed to either a user or a client principal.
+
+    ``user_id`` continues to populate ``actor_user_id`` for user-typed actors
+    so existing queries keep working. ``principal_type`` + ``principal_id``
+    cover client-driven actions where ``user_id`` is None — the OAuth2 token
+    endpoint, scheduled jobs run on behalf of a client, etc.
+    """
     from .models import AuditLog, AuditResult
+
+    resolved_principal_type: str | None
+    if principal_type is None:
+        resolved_principal_type = PrincipalType.user.value if user_id is not None else None
+    elif isinstance(principal_type, PrincipalType):
+        resolved_principal_type = principal_type.value
+    else:
+        resolved_principal_type = str(principal_type)
+
+    resolved_principal_id = principal_id
+    if resolved_principal_id is None and user_id is not None:
+        resolved_principal_id = str(user_id)
 
     entry = AuditLog(
         user_id=user_id,
@@ -294,6 +364,8 @@ async def log_audit(db: AsyncSession, user_id: int, action: str, target: str = "
         timestamp=datetime.now(UTC),
         event_type=action,
         actor_user_id=user_id,
+        actor_principal_type=resolved_principal_type,
+        actor_principal_id=resolved_principal_id,
         result=AuditResult.success,
         created_at=datetime.now(UTC),
     )
