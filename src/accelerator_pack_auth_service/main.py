@@ -1911,7 +1911,9 @@ async def sso_authorize(
     is a state we minted, that it hasn't been used, and that the ID token's
     ``nonce`` claim matches.
     """
-    from .sso_service import store_sso_state
+    from urllib.parse import urlencode
+
+    from .sso_service import discover_oidc_metadata, store_sso_state
 
     result = await db.execute(
         select(IdentityProvider).where(
@@ -1926,21 +1928,28 @@ async def sso_authorize(
     state, nonce = await store_sso_state(db, provider_id=provider.id, redirect_uri=redirect_uri)
 
     if provider.type.value == "oidc":
-        issuer = config.get("issuer", "")
-        client_id = config.get("client_id", "")
-        scope = config.get("scope", "openid email profile")
-        authorize_endpoint = config.get("authorize_url", f"{issuer}/authorize")
+        authorize_endpoint = config.get("authorize_url")
+        if not authorize_endpoint:
+            discovery = await discover_oidc_metadata(config.get("issuer", ""))
+            authorize_endpoint = discovery.get("authorization_endpoint")
+        if not authorize_endpoint:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="OIDC provider missing authorization_endpoint",
+            )
 
-        params = (
-            f"?client_id={client_id}"
-            f"&redirect_uri={redirect_uri}"
-            f"&response_type=code"
-            f"&scope={scope}"
-            f"&state={state}"
-            f"&nonce={nonce}"
+        params = urlencode(
+            {
+                "client_id": config.get("client_id", ""),
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": config.get("scope", "openid email profile"),
+                "state": state,
+                "nonce": nonce,
+            }
         )
         return {
-            "authorize_url": f"{authorize_endpoint}{params}",
+            "authorize_url": f"{authorize_endpoint}?{params}",
             "state": state,
             "provider_slug": slug,
         }

@@ -398,6 +398,66 @@ async def test_sso_authorize_oidc(client: AsyncClient):
     assert "state" in body
     assert "https://idp.example.com" in body["authorize_url"]
     assert "client_id=test-client" in body["authorize_url"]
+    # Params with reserved characters (the redirect URI's ":/", scope's space)
+    # must be percent-encoded — otherwise the IdP rejects the URL.
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A3000" in body["authorize_url"]
+    assert "scope=openid+email+profile" in body["authorize_url"]
+
+
+@pytest.mark.asyncio
+async def test_sso_authorize_oidc_uses_discovery_when_no_override(client: AsyncClient, respx_mock):
+    """Regression: when ``authorize_url`` isn't pinned in provider config,
+    the route consults the OIDC discovery doc rather than guessing
+    ``{issuer}/authorize`` (the old behavior broke IDCS, which advertises
+    ``/oauth2/v1/authorize``)."""
+    import httpx
+
+    from accelerator_pack_auth_service import sso_service
+
+    sso_service._discovery_cache.clear()
+
+    issuer = "https://idp-discovery.example.com"
+    respx_mock.get(f"{issuer}/.well-known/openid-configuration").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "issuer": issuer,
+                "authorization_endpoint": f"{issuer}/oauth2/v1/authorize",
+                "token_endpoint": f"{issuer}/oauth2/v1/token",
+                "userinfo_endpoint": f"{issuer}/oauth2/v1/userinfo",
+                "jwks_uri": f"{issuer}/admin/v1/SigningCert/jwk",
+            },
+        )
+    )
+
+    admin_token, _ = await _register_and_get_admin_token(client)
+    resp = await client.post(
+        "/auth/providers",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "type": "oidc",
+            "name": "Discovery-Driven IdP",
+            "slug": "idcs-style",
+            "config": {
+                "issuer": issuer,
+                "client_id": "discovery-client",
+                "client_secret": "discovery-secret",
+                # NOTE: no authorize_url override — must come from discovery.
+            },
+            "is_active": True,
+            "priority": 10,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    resp = await client.get(
+        "/auth/sso/idcs-style/authorize",
+        params={"redirect_uri": "http://localhost:3000/cb"},
+    )
+    assert resp.status_code == 200, resp.text
+    authorize_url = resp.json()["authorize_url"]
+    assert authorize_url.startswith(f"{issuer}/oauth2/v1/authorize?"), authorize_url
+    assert "client_id=discovery-client" in authorize_url
 
 
 @pytest.mark.asyncio
