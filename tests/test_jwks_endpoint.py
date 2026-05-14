@@ -10,7 +10,7 @@ async def test_jwks_endpoint_public_returns_active_key(client: AsyncClient):
         "/auth/register",
         json={"email": "jwks@test.com", "password": "password123", "name": "JWKS"},
     )
-    resp = await client.get("/.well-known/jwks.json")
+    resp = await client.get("/auth/.well-known/jwks.json")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/json")
     body = resp.json()
@@ -31,13 +31,13 @@ async def test_jwks_endpoint_sets_cache_control(client: AsyncClient):
         "/auth/register",
         json={"email": "cache@test.com", "password": "password123", "name": "Cache"},
     )
-    resp = await client.get("/.well-known/jwks.json")
+    resp = await client.get("/auth/.well-known/jwks.json")
     assert resp.headers["cache-control"] == "public, max-age=3600"
 
 
 @pytest.mark.asyncio
 async def test_jwks_endpoint_does_not_require_auth(client: AsyncClient):
-    resp = await client.get("/.well-known/jwks.json")
+    resp = await client.get("/auth/.well-known/jwks.json")
     assert resp.status_code == 200
 
 
@@ -54,6 +54,6 @@ async def test_issued_token_kid_present_in_jwks(client: AsyncClient):
     assert header["alg"] == "RS256"
     assert header["kid"]
 
-    jwks = (await client.get("/.well-known/jwks.json")).json()
+    jwks = (await client.get("/auth/.well-known/jwks.json")).json()
     kids = {k["kid"] for k in jwks["keys"]}
     assert header["kid"] in kids

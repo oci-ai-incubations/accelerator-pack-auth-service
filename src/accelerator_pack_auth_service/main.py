@@ -316,7 +316,7 @@ async def get_pack_model() -> dict:
 
 
 @app.get(
-    "/.well-known/jwks.json",
+    "/auth/.well-known/jwks.json",
     summary="JSON Web Key Set",
     description=(
         "RFC 7517 JWKS document. Returns every signing key that is either "
@@ -335,7 +335,7 @@ async def get_jwks(response: Response, db: AsyncSession = Depends(get_db)) -> di
 
 
 @app.get(
-    "/.well-known/openid-configuration",
+    "/auth/.well-known/openid-configuration",
     summary="OIDC discovery document",
     description=(
         "RFC 8414 OIDC discovery doc. Lets external verifiers auto-discover "
@@ -359,8 +359,8 @@ async def get_oidc_discovery() -> dict:
     return {
         "issuer": issuer,
         "jwks_uri": f"{issuer}/.well-known/jwks.json",
-        "token_endpoint": f"{issuer}/auth/login",
-        "userinfo_endpoint": f"{issuer}/auth/me",
+        "token_endpoint": f"{issuer}/login",
+        "userinfo_endpoint": f"{issuer}/me",
         "id_token_signing_alg_values_supported": ["RS256"],
         "response_types_supported": ["token"],
         "subject_types_supported": ["public"],

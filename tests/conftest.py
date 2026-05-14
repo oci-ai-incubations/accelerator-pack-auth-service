@@ -6,7 +6,7 @@ import os
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
 os.environ["AUTH_DATABASE_URL"] = TEST_DB_URL
-os.environ["AUTH_ISSUER_URL"] = "https://auth-service.test"
+os.environ["AUTH_ISSUER_URL"] = "https://auth-service.test/auth"
 os.environ["AUTH_RATE_LIMIT_LOGIN"] = "1000/minute"
 os.environ["AUTH_RATE_LIMIT_REGISTER"] = "1000/minute"
 os.environ["AUTH_ACCOUNT_LOCKOUT_THRESHOLD"] = "3"

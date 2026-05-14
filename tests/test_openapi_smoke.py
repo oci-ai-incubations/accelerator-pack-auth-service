@@ -24,8 +24,8 @@ PUBLIC_PATHS: set[tuple[str, str]] = {
     ("get", "/auth/sso/providers"),
     ("get", "/auth/sso/{slug}/authorize"),
     ("post", "/auth/sso/{slug}/token"),
-    ("get", "/.well-known/jwks.json"),
-    ("get", "/.well-known/openid-configuration"),
+    ("get", "/auth/.well-known/jwks.json"),
+    ("get", "/auth/.well-known/openid-configuration"),
 }
 
 
