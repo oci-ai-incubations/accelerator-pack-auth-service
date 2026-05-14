@@ -158,8 +158,106 @@ _jwks_cache: dict[str, tuple[float, PyJWKSet]] = {}
 _jwks_cache_lock = threading.Lock()
 
 
-async def _fetch_jwks(jwks_url: str) -> PyJWKSet:
-    """Fetch (or return cached) PyJWKSet for ``jwks_url``."""
+# Client-credentials token cache — one bearer per (token_url, client_id) +
+# the absolute monotonic time it expires. Used as the OAuth fallback path
+# when an IdP's JWKS endpoint is admin-gated (e.g. OCI IAM Identity Domains
+# expose ``jwks_uri`` at ``/admin/v1/SigningCert/jwk``, which rejects
+# unauthenticated GETs).
+_cc_token_cache: dict[tuple[str, str], tuple[float, str]] = {}
+_cc_token_cache_lock = threading.Lock()
+
+
+# Default scope requested when grabbing a client_credentials token to fetch
+# admin-gated JWKS. ``urn:opc:idm:__myscopes__`` is the IDCS-specific meta
+# scope meaning "all scopes this app has been granted via app roles" —
+# operators grant the ``Authenticator Client`` (or equivalent) app role on
+# the OAuth client. Override per-provider via ``config.jwks_fallback_scope``.
+_DEFAULT_JWKS_FALLBACK_SCOPE = "urn:opc:idm:__myscopes__"
+
+# CC-token cache margin — refresh ``_CC_TOKEN_REFRESH_MARGIN`` seconds before
+# the IdP-reported expiry so an in-flight request never trips on a freshly
+# expired token. 60s comfortably covers clock skew + JWKS fetch latency.
+_CC_TOKEN_REFRESH_MARGIN = 60
+
+
+async def _client_credentials_token(
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+    scope: str | None,
+) -> str:
+    """Fetch (or return cached) a ``client_credentials`` bearer token.
+
+    Used only as a fallback when the IdP gates its JWKS endpoint behind
+    OAuth. The token is cached per ``(token_url, client_id)`` until
+    ``_CC_TOKEN_REFRESH_MARGIN`` seconds before the IdP-reported ``expires_in``.
+    """
+    cache_key = (token_url, client_id)
+    now = time.monotonic()
+    with _cc_token_cache_lock:
+        cached = _cc_token_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    data = {"grant_type": "client_credentials"}
+    if scope:
+        data["scope"] = scope
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            token_url,
+            data=data,
+            auth=(client_id, client_secret),
+            headers={"Accept": "application/json"},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                f"Client-credentials token fetch failed ({resp.status_code}) "
+                f"at {token_url}: {resp.text}"
+            ),
+        )
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Client-credentials response at {token_url} was not JSON",
+        ) from exc
+
+    access_token = payload.get("access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Client-credentials response at {token_url} missing access_token",
+        )
+
+    expires_in = int(payload.get("expires_in", 300))
+    ttl = max(expires_in - _CC_TOKEN_REFRESH_MARGIN, 30)
+    with _cc_token_cache_lock:
+        _cc_token_cache[cache_key] = (now + ttl, access_token)
+    return access_token
+
+
+async def _fetch_jwks(
+    jwks_url: str,
+    *,
+    oauth_fallback: tuple[str, str, str, str | None] | None = None,
+) -> PyJWKSet:
+    """Fetch (or return cached) PyJWKSet for ``jwks_url``.
+
+    ``oauth_fallback`` — when supplied as
+    ``(token_url, client_id, client_secret, scope)``, a 401 from the
+    unauthenticated GET triggers a ``client_credentials`` grant against
+    ``token_url`` and a retry with ``Authorization: Bearer``. This
+    accommodates IdPs whose JWKS endpoint is admin-gated (OCI IAM Identity
+    Domains, in particular, expose ``jwks_uri`` at
+    ``/admin/v1/SigningCert/jwk`` which rejects anonymous requests). The
+    fallback is opt-in — passing ``None`` preserves the strict public-JWKS
+    behavior expected of standards-compliant OIDC providers.
+    """
     now = time.monotonic()
     with _jwks_cache_lock:
         cached = _jwks_cache.get(jwks_url)
@@ -168,6 +266,14 @@ async def _fetch_jwks(jwks_url: str) -> PyJWKSet:
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(jwks_url)
+        if resp.status_code == 401 and oauth_fallback is not None:
+            token_url, client_id, client_secret, scope = oauth_fallback
+            bearer = await _client_credentials_token(token_url, client_id, client_secret, scope)
+            resp = await client.get(
+                jwks_url,
+                headers={"Authorization": f"Bearer {bearer}"},
+            )
+
     if resp.status_code != 200:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -531,7 +637,16 @@ async def exchange_oidc_code(
                 detail="IdP token response missing id_token",
             )
 
-        jwks = await _fetch_jwks(jwks_url)
+        jwks_fallback: tuple[str, str, str, str | None] | None = None
+        if token_url and client_id and client_secret:
+            jwks_fallback = (
+                token_url,
+                client_id,
+                client_secret,
+                config.get("jwks_fallback_scope", _DEFAULT_JWKS_FALLBACK_SCOPE),
+            )
+
+        jwks = await _fetch_jwks(jwks_url, oauth_fallback=jwks_fallback)
         claims = _verify_id_token_with_jwks(
             id_token,
             jwks=jwks,

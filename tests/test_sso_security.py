@@ -467,3 +467,120 @@ async def test_select_external_id_prefers_oid_then_user_id_then_sub():
     assert select_external_id({"sub": "s", "user_id": "u"}) == "u"
     assert select_external_id({"sub": "s"}) == "s"
     assert select_external_id({}) == ""
+
+
+# ── Authenticated JWKS fallback (IDCS-style admin-gated JWKS) ─────
+
+
+def _reset_jwks_caches() -> None:
+    sso_service._jwks_cache.clear()
+    sso_service._cc_token_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_fetch_jwks_401_without_fallback_raises(respx_mock):
+    """Standard OIDC: a 401 on the JWKS endpoint is a hard failure."""
+    from fastapi import HTTPException
+
+    _reset_jwks_caches()
+    respx_mock.get(IDP_JWKS_URL).mock(return_value=httpx.Response(401))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sso_service._fetch_jwks(IDP_JWKS_URL)
+    assert exc_info.value.status_code == 401
+    assert "JWKS fetch failed (401)" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_fetch_jwks_401_with_fallback_retries_authenticated(respx_mock):
+    """IDCS-style admin-gated JWKS: 401 triggers a client_credentials retry."""
+    _reset_jwks_caches()
+    _, public_jwk, _ = _mint_idp_keypair(kid="gated-kid")
+
+    respx_mock.get(IDP_JWKS_URL).mock(
+        side_effect=[
+            httpx.Response(401),
+            httpx.Response(200, json={"keys": [public_jwk]}),
+        ]
+    )
+    token_route = respx_mock.post(IDP_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "cc-bearer",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            },
+        )
+    )
+
+    jwks = await sso_service._fetch_jwks(
+        IDP_JWKS_URL,
+        oauth_fallback=(
+            IDP_TOKEN_URL,
+            IDP_CLIENT_ID,
+            IDP_CLIENT_SECRET,
+            "urn:opc:idm:__myscopes__",
+        ),
+    )
+    assert jwks["gated-kid"] is not None
+    assert token_route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_jwks_fallback_cc_failure_surfaces_cc_error(respx_mock):
+    """When the fallback CC grant itself fails, the error names the CC step."""
+    from fastapi import HTTPException
+
+    _reset_jwks_caches()
+    respx_mock.get(IDP_JWKS_URL).mock(return_value=httpx.Response(401))
+    respx_mock.post(IDP_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            401, json={"error": "unauthorized_client", "error_description": "no grant"}
+        )
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sso_service._fetch_jwks(
+            IDP_JWKS_URL,
+            oauth_fallback=(IDP_TOKEN_URL, IDP_CLIENT_ID, IDP_CLIENT_SECRET, None),
+        )
+    assert exc_info.value.status_code == 401
+    assert "Client-credentials token fetch failed" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_client_credentials_token_is_cached_across_calls(respx_mock):
+    """Second call within TTL hits the cache rather than re-POSTing."""
+    _reset_jwks_caches()
+    token_route = respx_mock.post(IDP_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "cached-bearer", "expires_in": 3600},
+        )
+    )
+
+    first = await sso_service._client_credentials_token(
+        IDP_TOKEN_URL, IDP_CLIENT_ID, IDP_CLIENT_SECRET, "openid"
+    )
+    second = await sso_service._client_credentials_token(
+        IDP_TOKEN_URL, IDP_CLIENT_ID, IDP_CLIENT_SECRET, "openid"
+    )
+    assert first == second == "cached-bearer"
+    assert token_route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_client_credentials_token_missing_access_token_raises(respx_mock):
+    from fastapi import HTTPException
+
+    _reset_jwks_caches()
+    respx_mock.post(IDP_TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"token_type": "Bearer"})
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sso_service._client_credentials_token(
+            IDP_TOKEN_URL, IDP_CLIENT_ID, IDP_CLIENT_SECRET, None
+        )
+    assert "missing access_token" in exc_info.value.detail
