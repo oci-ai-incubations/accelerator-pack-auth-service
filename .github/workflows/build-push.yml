@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - redbull-racing
+  workflow_dispatch: {}
 
 jobs:
   build-and-push:
@@ -35,12 +36,18 @@ jobs:
         id: version
         run: echo "value=$(cat VERSION)" >> $GITHUB_OUTPUT
 
+      - name: Compute short SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
       - name: Build Docker Image
         run: docker build -t "${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}" -f ./Dockerfile .
 
-      - name: Tag and Push Docker Image
+      - name: Tag and Push Docker Image (version + SHA)
         env:
           IMAGE_REMOTE: "iad.ocir.io/${{ secrets.OCI_TENANCY_NAMESPACE }}/${{ env.IMAGE_NAME }}"
         run: |
           docker tag "${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}" "${{ env.IMAGE_REMOTE }}:${{ steps.version.outputs.value }}"
           docker push "${{ env.IMAGE_REMOTE }}:${{ steps.version.outputs.value }}"
+          # Also push an immutable SHA-suffixed copy so TF can pin precisely.
+          docker tag "${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}" "${{ env.IMAGE_REMOTE }}:${{ steps.version.outputs.value }}-${{ env.SHORT_SHA }}"
+          docker push "${{ env.IMAGE_REMOTE }}:${{ steps.version.outputs.value }}-${{ env.SHORT_SHA }}"

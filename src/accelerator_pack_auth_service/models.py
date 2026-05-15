@@ -47,6 +47,19 @@ class Role(enum.StrEnum):
     pending = "pending"
 
 
+class PrincipalType(enum.StrEnum):
+    """Discriminator for the JWT ``principal_type`` claim.
+
+    Separates human callers (``user`` — fronted by login + refresh tokens) from
+    machine callers (``client`` — OAuth2 client_credentials grant). Pack BEs
+    branch on this when distinguishing role-gated routes (humans only) from
+    scope-gated routes (either).
+    """
+
+    user = "user"
+    client = "client"
+
+
 class PermissionLevel(enum.StrEnum):
     read = "read"
     write = "write"
@@ -63,6 +76,11 @@ class User(Base):
     role = Column(Enum(Role), nullable=False, default=Role.pending)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    # JSON-encoded list of scope codenames. NULL means "use the role's full
+    # permission set" — the common case. Non-NULL pins this user to a narrower
+    # default scope set (rare; e.g. a power user who wants to limit their own
+    # default token blast radius). Spec 003.
+    allowed_scopes = Column(Text, nullable=True)
 
     collection_permissions = relationship(
         "CollectionPermission", back_populates="user", cascade="all, delete-orphan"
@@ -344,6 +362,54 @@ class GroupRole(Base):
     role = relationship("DbRole")
 
 
+class SsoState(Base):
+    """Single-use SSO state token bound to a provider, redirect_uri, and nonce.
+
+    Issued at ``/auth/sso/{slug}/authorize`` and verified at the callback in
+    ``/auth/sso/{slug}/token``. Single-use semantics protect against CSRF on
+    the IdP callback (state) and OIDC ID-token replay (nonce). Expired or
+    consumed rows stay in the table for audit replay-detection until the next
+    background sweep; deletion on consume keeps the table small in the common
+    case.
+    """
+
+    __tablename__ = "sso_state"
+
+    state = Column(String(128), primary_key=True)
+    nonce = Column(String(64), nullable=False)
+    provider_id = Column(
+        Integer, ForeignKey("identity_providers.id", ondelete="CASCADE"), nullable=False
+    )
+    redirect_uri = Column(String(2048), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    expires_at = Column(DateTime, nullable=False, index=True)
+
+
+class SigningKeyStatus(enum.StrEnum):
+    active = "active"
+    rotating_out = "rotating_out"
+    revoked = "revoked"
+
+
+class SigningKey(Base):
+    __tablename__ = "signing_keys"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    kid = Column(String(64), nullable=False, unique=True, index=True)
+    algorithm = Column(String(16), nullable=False, default="RS256")
+    public_pem = Column(Text, nullable=False)
+    private_pem = Column(Text, nullable=False)
+    status = Column(
+        Enum(SigningKeyStatus),
+        nullable=False,
+        default=SigningKeyStatus.active,
+        index=True,
+    )
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    rotated_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+
+
 class AuditResult(enum.StrEnum):
     success = "success"
     failure = "failure"
@@ -357,6 +423,11 @@ class AuditLog(Base):
     event_type = Column(String(100), nullable=False, index=True)
     actor_user_id = Column(Integer, nullable=True)
     actor_email = Column(String(320), nullable=True)
+    # Principal-typed actor fields supersede actor_user_id for client-driven
+    # actions. actor_user_id stays populated for user-typed actors so existing
+    # queries / dashboards keep working without an immediate migration.
+    actor_principal_type = Column(String(16), nullable=True)
+    actor_principal_id = Column(String(128), nullable=True)
     target_type = Column(String(100), nullable=True)
     target_id = Column(String(255), nullable=True)
     tenant_id = Column(Integer, nullable=True)
@@ -370,3 +441,31 @@ class AuditLog(Base):
     target = Column(String(255), nullable=True)
     detail = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=True, default=lambda: datetime.now(UTC))
+
+
+class ServiceAccount(Base):
+    """OAuth2 client_credentials principal — machine-to-machine identity.
+
+    Created by an admin via the /auth/admin/clients API; authenticated against
+    the token endpoint with a bcrypt-hashed shared secret. The plaintext
+    secret is shown exactly once at creation (or rotation) and is never
+    persisted. Tokens minted for this account carry ``principal_type=client``
+    and ``sub=client:<client_id>``.
+    """
+
+    __tablename__ = "service_accounts"
+
+    id = Column(Integer, Identity(always=True), primary_key=True)
+    client_id = Column(String(64), unique=True, nullable=False, index=True)
+    client_secret_hash = Column(String(128), nullable=False)
+    name = Column(String(128), nullable=False)
+    description = Column(Text, nullable=True)
+    # JSON-encoded list of scope codenames. Empty string = no scopes granted.
+    scopes = Column(Text, nullable=False, default="")
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    revoked_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+    last_used_ip = Column(String(45), nullable=True)
