@@ -93,7 +93,12 @@ from .schemas import (
     UserRoleAssign,
     UserRoleResponse,
 )
-from .scopes import InvalidScopeError, grant_scopes, parse_scope_string, resolve_principal_scopes
+from .scopes import (
+    InvalidScopeError,
+    grant_scopes,
+    parse_scope_string,
+    resolve_effective_user_scopes,
+)
 
 # RFC 6749 §5.2 error codes for the OAuth2 token endpoint. Named here as a
 # constant so route handlers never construct error bodies inline (drift risk
@@ -655,7 +660,11 @@ async def _grant_user_scopes(
     requesting scopes their role can't ever grant.
     """
     pack_model = load_active_model(settings.pack)
-    allowed = resolve_principal_scopes(user, pack_model)
+    # resolve_effective_user_scopes unions in UserRole-assigned permissions
+    # so custom roles assigned via /auth/users/{id}/roles are honored at
+    # login time, matching the runtime permission gate. Mirrors the same
+    # helper used by create_access_token for register + refresh.
+    allowed = await resolve_effective_user_scopes(db, user, pack_model)
     requested = parse_scope_string(requested_scope)
     try:
         return grant_scopes(allowed, requested, strict=settings.strict_scopes)

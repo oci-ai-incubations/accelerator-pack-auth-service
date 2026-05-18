@@ -160,10 +160,9 @@ async def fetch_user_role_permissions(db: AsyncSession, user_id: int) -> set[str
     uses, but returned as a set for unioning into a JWT scope claim at token-
     issue time.
 
-    Callers should union this set with the principal's primary-role scopes
-    from :func:`resolve_principal_scopes` when minting tokens; otherwise the
-    JWT under-advertises and FEs that gate on the ``scope`` claim will deny
-    actions the BE would actually authorize.
+    Callers should prefer :func:`resolve_effective_user_scopes` over invoking
+    this directly — the helper handles the ``allowed_scopes`` narrowing
+    override and the union semantics consistently.
     """
     result = await db.execute(
         select(Permission.codename)
@@ -174,3 +173,32 @@ async def fetch_user_role_permissions(db: AsyncSession, user_id: int) -> set[str
         .distinct()
     )
     return {row[0] for row in result.all()}
+
+
+async def resolve_effective_user_scopes(
+    db: AsyncSession, user: User, pack_model: PackAuthModel
+) -> list[str]:
+    """Resolve the full set of scopes a user is currently allowed to hold.
+
+    This is :func:`resolve_principal_scopes` plus the union of every
+    permission codename reachable through the user's UserRole assignments.
+    Both the static pack-model role expansion and the dynamic UserRole
+    assignment are honored, matching what the runtime gate
+    ``permission_service.user_has_permission`` evaluates.
+
+    If the user has an explicit ``allowed_scopes`` narrowing override, that
+    overrides everything (mirrors :func:`resolve_principal_scopes` behavior) —
+    we don't expand past a deliberate narrowing.
+
+    Every issuance path that mints a user access token must use this helper
+    (login + register + refresh) so the JWT scope claim is consistent across
+    flows and reflects every permission the user can currently exercise.
+    """
+    base = list(resolve_principal_scopes(user, pack_model))
+    if user.allowed_scopes:
+        # Explicit narrowing override — do not expand past it.
+        return base
+    extra = await fetch_user_role_permissions(db, user.id)
+    if not extra:
+        return base
+    return sorted(set(base) | extra)
