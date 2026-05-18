@@ -83,11 +83,23 @@ async def create_access_token(db: AsyncSession, user: User, scopes: list[str] | 
     in the claim, so verifiers never need wildcard logic on the read path.
     """
     from .pack_models import load_active_model
-    from .scopes import resolve_principal_scopes
+    from .scopes import fetch_user_role_permissions, resolve_principal_scopes
 
     signing_key = await get_active_signing_key(db)
     if scopes is None:
         scopes = resolve_principal_scopes(user, load_active_model(settings.pack))
+        # Union in permissions reachable through the user's UserRole
+        # assignments. Without this the JWT only advertises the primary
+        # role's scope set even though permission_service.user_has_permission
+        # (the runtime gate) checks UserRole too — FEs that read `scope`
+        # to gate UI would deny actions the BE would authorize, and admins
+        # assigning custom roles via the admin panel would see no effect
+        # until a re-login that still wouldn't help. `allowed_scopes` is
+        # an *explicit* narrowing override, so we don't expand past it.
+        if not user.allowed_scopes:
+            extra = await fetch_user_role_permissions(db, user.id)
+            if extra:
+                scopes = sorted(set(scopes) | extra)
     payload = {
         "sub": str(user.id),
         "email": user.email,

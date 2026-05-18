@@ -15,7 +15,10 @@ without booting the FastAPI app or the DB.
 
 import json
 
-from .models import ServiceAccount, User
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .models import DbRole, Permission, RolePermission, ServiceAccount, User, UserRole
 from .pack_models import PackAuthModel
 
 # Wildcard sentinel: a principal whose stamped scope set contains this token
@@ -147,3 +150,27 @@ def grant_scopes(allowed: list[str], requested: list[str] | None, *, strict: boo
         raise InvalidScopeError(f"requested scopes not allowed: {unallowed}")
 
     return granted
+
+
+async def fetch_user_role_permissions(db: AsyncSession, user_id: int) -> set[str]:
+    """Return permission codenames reachable from a user's UserRole assignments.
+
+    Walks UserRole → DbRole → RolePermission → Permission. The same join the
+    runtime permission check at ``permission_service.user_has_permission``
+    uses, but returned as a set for unioning into a JWT scope claim at token-
+    issue time.
+
+    Callers should union this set with the principal's primary-role scopes
+    from :func:`resolve_principal_scopes` when minting tokens; otherwise the
+    JWT under-advertises and FEs that gate on the ``scope`` claim will deny
+    actions the BE would actually authorize.
+    """
+    result = await db.execute(
+        select(Permission.codename)
+        .join(RolePermission, RolePermission.permission_id == Permission.id)
+        .join(DbRole, DbRole.id == RolePermission.role_id)
+        .join(UserRole, UserRole.role_id == DbRole.id)
+        .where(UserRole.user_id == user_id)
+        .distinct()
+    )
+    return {row[0] for row in result.all()}
