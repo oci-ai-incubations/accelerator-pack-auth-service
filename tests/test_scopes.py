@@ -267,9 +267,7 @@ async def _seed_user_with_custom_role(
 
 
 @pytest.mark.asyncio
-async def test_resolve_effective_user_scopes_unions_user_role_permissions(
-    db_session, monkeypatch
-):
+async def test_resolve_effective_user_scopes_unions_user_role_permissions(db_session, monkeypatch):
     """Headline behavior: a Reader-primary user with a custom role that
     grants vss.summarize + vss.review gets all three scopes (base ∪ extra)."""
     from accelerator_pack_auth_service.config import settings

@@ -92,9 +92,7 @@ async def create_access_token(db: AsyncSession, user: User, scopes: list[str] | 
         # permission the runtime gate would grant. Used here for register +
         # refresh (login pre-resolves via _grant_user_scopes, which uses
         # the same helper).
-        scopes = await resolve_effective_user_scopes(
-            db, user, load_active_model(settings.pack)
-        )
+        scopes = await resolve_effective_user_scopes(db, user, load_active_model(settings.pack))
     payload = {
         "sub": str(user.id),
         "email": user.email,
