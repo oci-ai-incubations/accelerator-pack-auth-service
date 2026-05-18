@@ -193,12 +193,21 @@ async def resolve_effective_user_scopes(
     Every issuance path that mints a user access token must use this helper
     (login + register + refresh) so the JWT scope claim is consistent across
     flows and reflects every permission the user can currently exercise.
+
+    Order: the pack-model expansion order from :func:`resolve_principal_scopes`
+    is preserved as the prefix, with any new UserRole-only permissions
+    appended in sorted order. This means the union path and the no-union
+    path produce byte-identical scope claims for the same base set, which
+    keeps :func:`grant_scopes` order-stable for upstream token caching.
     """
-    base = list(resolve_principal_scopes(user, pack_model))
+    base = resolve_principal_scopes(user, pack_model)
     if user.allowed_scopes:
         # Explicit narrowing override — do not expand past it.
         return base
     extra = await fetch_user_role_permissions(db, user.id)
     if not extra:
         return base
-    return sorted(set(base) | extra)
+    new_extras = sorted(extra - set(base))
+    if not new_extras:
+        return base
+    return base + new_extras

@@ -4,12 +4,22 @@ import json
 
 import pytest
 
-from accelerator_pack_auth_service.models import Role, ServiceAccount, User
+from accelerator_pack_auth_service.models import (
+    DbRole,
+    Permission,
+    Role,
+    RolePermission,
+    ServiceAccount,
+    User,
+    UserRole,
+)
 from accelerator_pack_auth_service.pack_models import load_active_model
 from accelerator_pack_auth_service.scopes import (
     InvalidScopeError,
+    fetch_user_role_permissions,
     grant_scopes,
     parse_scope_string,
+    resolve_effective_user_scopes,
     resolve_principal_scopes,
 )
 
@@ -208,3 +218,157 @@ def test_grant_strict_no_request_returns_full_allowed_set():
     # Strict mode only fires when the request asks for *something*; empty
     # request is the "no scope requested" RFC path and is treated the same.
     assert grant_scopes(["cuopt.solve"], None, strict=True) == ["cuopt.solve"]
+
+
+# ── fetch_user_role_permissions / resolve_effective_user_scopes ──
+
+
+async def _seed_user_with_custom_role(
+    session,
+    *,
+    email: str,
+    primary_role: Role,
+    role_name: str,
+    permission_codenames: list[str],
+    allowed_scopes: str | None = None,
+) -> User:
+    """Create a user + a custom DbRole with the given permissions, assigned via UserRole."""
+    user = User(
+        email=email,
+        name=email.split("@")[0],
+        password_hash="x",
+        role=primary_role,
+        allowed_scopes=allowed_scopes,
+    )
+    session.add(user)
+    await session.flush()
+
+    role = DbRole(name=role_name, description=f"custom {role_name}", is_system=False)
+    session.add(role)
+    await session.flush()
+
+    for codename in permission_codenames:
+        result = await session.execute(
+            Permission.__table__.select().where(Permission.codename == codename)
+        )
+        row = result.first()
+        if row is None:
+            perm = Permission(codename=codename, description=codename)
+            session.add(perm)
+            await session.flush()
+            perm_id = perm.id
+        else:
+            perm_id = row.id
+        session.add(RolePermission(role_id=role.id, permission_id=perm_id))
+
+    session.add(UserRole(user_id=user.id, role_id=role.id))
+    await session.commit()
+    return user
+
+
+@pytest.mark.asyncio
+async def test_resolve_effective_user_scopes_unions_user_role_permissions(
+    db_session, monkeypatch
+):
+    """Headline behavior: a Reader-primary user with a custom role that
+    grants vss.summarize + vss.review gets all three scopes (base ∪ extra)."""
+    from accelerator_pack_auth_service.config import settings
+
+    monkeypatch.setattr(settings, "pack", "vss")
+    model = load_active_model("vss")
+
+    user = await _seed_user_with_custom_role(
+        db_session,
+        email="union@scopes.test",
+        primary_role=Role.reader,
+        role_name="analyst",
+        permission_codenames=["vss.summarize", "vss.review"],
+    )
+
+    scopes = await resolve_effective_user_scopes(db_session, user, model)
+
+    # Base prefix preserved (reader → ["vss.view"]), new extras appended in
+    # sorted order so order is deterministic across calls.
+    assert scopes == ["vss.view", "vss.review", "vss.summarize"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_effective_user_scopes_allowed_scopes_override_skips_union(
+    db_session, monkeypatch
+):
+    """A user with allowed_scopes set must NOT have UserRole permissions
+    unioned in — allowed_scopes is a deliberate narrowing override."""
+    from accelerator_pack_auth_service.config import settings
+
+    monkeypatch.setattr(settings, "pack", "vss")
+    model = load_active_model("vss")
+
+    user = await _seed_user_with_custom_role(
+        db_session,
+        email="narrow@scopes.test",
+        primary_role=Role.reader,
+        role_name="would-grant-more",
+        permission_codenames=["vss.summarize"],
+        allowed_scopes=json.dumps(["vss.view"]),
+    )
+
+    scopes = await resolve_effective_user_scopes(db_session, user, model)
+
+    # The override pins the scope set; the UserRole-granted vss.summarize is
+    # NOT unioned in.
+    assert scopes == ["vss.view"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_role_permissions_dedupes_across_overlapping_roles(db_session):
+    """When two DbRoles both grant the same permission, the helper returns
+    it once. Pins the ``.distinct()`` claim in the docstring."""
+    user = User(
+        email="dedupe@scopes.test",
+        name="dedupe",
+        password_hash="x",
+        role=Role.user,
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    perm = Permission(codename="vss.view", description="vss.view")
+    db_session.add(perm)
+    await db_session.flush()
+
+    for role_name in ("role_a", "role_b"):
+        role = DbRole(name=role_name, is_system=False)
+        db_session.add(role)
+        await db_session.flush()
+        db_session.add(RolePermission(role_id=role.id, permission_id=perm.id))
+        db_session.add(UserRole(user_id=user.id, role_id=role.id))
+    await db_session.commit()
+
+    result = await fetch_user_role_permissions(db_session, user.id)
+    assert result == {"vss.view"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_effective_user_scopes_empty_user_roles_returns_base_unchanged(
+    db_session, monkeypatch
+):
+    """Short-circuit at the empty-extra branch: a user with zero UserRole
+    rows gets back exactly resolve_principal_scopes — no sort, no rewrap."""
+    from accelerator_pack_auth_service.config import settings
+
+    monkeypatch.setattr(settings, "pack", "vss")
+    model = load_active_model("vss")
+
+    user = User(
+        email="bare@scopes.test",
+        name="bare",
+        password_hash="x",
+        role=Role.user,
+    )
+    db_session.add(user)
+    await db_session.commit()
+
+    scopes = await resolve_effective_user_scopes(db_session, user, model)
+    # vss "user" role expands to vss.summarize + vss.view + vss.review in
+    # the pack-model-declared order. The empty-extra path must preserve it.
+    assert scopes == ["vss.summarize", "vss.view", "vss.review"]
