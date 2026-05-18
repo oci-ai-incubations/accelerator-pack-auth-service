@@ -83,11 +83,16 @@ async def create_access_token(db: AsyncSession, user: User, scopes: list[str] | 
     in the claim, so verifiers never need wildcard logic on the read path.
     """
     from .pack_models import load_active_model
-    from .scopes import resolve_principal_scopes
+    from .scopes import resolve_effective_user_scopes
 
     signing_key = await get_active_signing_key(db)
     if scopes is None:
-        scopes = resolve_principal_scopes(user, load_active_model(settings.pack))
+        # resolve_effective_user_scopes unions UserRole-assigned permissions
+        # into the primary-role scope set so the JWT advertises every
+        # permission the runtime gate would grant. Used here for register +
+        # refresh (login pre-resolves via _grant_user_scopes, which uses
+        # the same helper).
+        scopes = await resolve_effective_user_scopes(db, user, load_active_model(settings.pack))
     payload = {
         "sub": str(user.id),
         "email": user.email,

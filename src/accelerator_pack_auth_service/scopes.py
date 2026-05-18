@@ -15,7 +15,10 @@ without booting the FastAPI app or the DB.
 
 import json
 
-from .models import ServiceAccount, User
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .models import DbRole, Permission, RolePermission, ServiceAccount, User, UserRole
 from .pack_models import PackAuthModel
 
 # Wildcard sentinel: a principal whose stamped scope set contains this token
@@ -147,3 +150,64 @@ def grant_scopes(allowed: list[str], requested: list[str] | None, *, strict: boo
         raise InvalidScopeError(f"requested scopes not allowed: {unallowed}")
 
     return granted
+
+
+async def fetch_user_role_permissions(db: AsyncSession, user_id: int) -> set[str]:
+    """Return permission codenames reachable from a user's UserRole assignments.
+
+    Walks UserRole → DbRole → RolePermission → Permission. The same join the
+    runtime permission check at ``permission_service.user_has_permission``
+    uses, but returned as a set for unioning into a JWT scope claim at token-
+    issue time.
+
+    Callers should prefer :func:`resolve_effective_user_scopes` over invoking
+    this directly — the helper handles the ``allowed_scopes`` narrowing
+    override and the union semantics consistently.
+    """
+    result = await db.execute(
+        select(Permission.codename)
+        .join(RolePermission, RolePermission.permission_id == Permission.id)
+        .join(DbRole, DbRole.id == RolePermission.role_id)
+        .join(UserRole, UserRole.role_id == DbRole.id)
+        .where(UserRole.user_id == user_id)
+        .distinct()
+    )
+    return {row[0] for row in result.all()}
+
+
+async def resolve_effective_user_scopes(
+    db: AsyncSession, user: User, pack_model: PackAuthModel
+) -> list[str]:
+    """Resolve the full set of scopes a user is currently allowed to hold.
+
+    This is :func:`resolve_principal_scopes` plus the union of every
+    permission codename reachable through the user's UserRole assignments.
+    Both the static pack-model role expansion and the dynamic UserRole
+    assignment are honored, matching what the runtime gate
+    ``permission_service.user_has_permission`` evaluates.
+
+    If the user has an explicit ``allowed_scopes`` narrowing override, that
+    overrides everything (mirrors :func:`resolve_principal_scopes` behavior) —
+    we don't expand past a deliberate narrowing.
+
+    Every issuance path that mints a user access token must use this helper
+    (login + register + refresh) so the JWT scope claim is consistent across
+    flows and reflects every permission the user can currently exercise.
+
+    Order: the pack-model expansion order from :func:`resolve_principal_scopes`
+    is preserved as the prefix, with any new UserRole-only permissions
+    appended in sorted order. This means the union path and the no-union
+    path produce byte-identical scope claims for the same base set, which
+    keeps :func:`grant_scopes` order-stable for upstream token caching.
+    """
+    base = resolve_principal_scopes(user, pack_model)
+    if user.allowed_scopes:
+        # Explicit narrowing override — do not expand past it.
+        return base
+    extra = await fetch_user_role_permissions(db, user.id)
+    if not extra:
+        return base
+    new_extras = sorted(extra - set(base))
+    if not new_extras:
+        return base
+    return base + new_extras
