@@ -12,6 +12,27 @@ async def _get_admin_token(client: AsyncClient) -> str:
     return resp.json()["access_token"]
 
 
+def _oidc_config(**extra) -> dict:
+    """OIDC config with all endpoint overrides set so discovery is skipped.
+
+    Provider create/update calls ``_prefetch_oidc_discovery`` which probes
+    the issuer's ``.well-known/openid-configuration`` unless every endpoint
+    override is supplied. Tests in this module never actually exchange auth
+    codes so the override URLs can be placeholders.
+    """
+    base = {
+        "issuer": "https://idp.example.com",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "token_url": "https://idp.example.com/token",
+        "userinfo_url": "https://idp.example.com/userinfo",
+        "jwks_url": "https://idp.example.com/jwks",
+        "authorize_url": "https://idp.example.com/authorize",
+    }
+    base.update(extra)
+    return base
+
+
 # ── Provider CRUD ────────────────────────────────
 
 
@@ -24,11 +45,7 @@ async def test_create_oidc_provider(client: AsyncClient):
             "type": "oidc",
             "name": "Test OIDC",
             "slug": "test-oidc",
-            "config": {
-                "client_id": "test-client",
-                "client_secret": "test-secret",
-                "issuer": "https://idp.example.com",
-            },
+            "config": _oidc_config(),
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -61,12 +78,12 @@ async def test_create_duplicate_slug_fails(client: AsyncClient):
     token = await _get_admin_token(client)
     await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "First", "slug": "dup-slug", "config": {}},
+        json={"type": "oidc", "name": "First", "slug": "dup-slug", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     resp = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Second", "slug": "dup-slug", "config": {}},
+        json={"type": "oidc", "name": "Second", "slug": "dup-slug", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 409
@@ -77,7 +94,7 @@ async def test_list_providers(client: AsyncClient):
     token = await _get_admin_token(client)
     await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "P1", "slug": "p1", "config": {}},
+        json={"type": "oidc", "name": "P1", "slug": "p1", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     resp = await client.get("/auth/providers", headers={"Authorization": f"Bearer {token}"})
@@ -90,7 +107,7 @@ async def test_update_provider(client: AsyncClient):
     token = await _get_admin_token(client)
     create = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Old Name", "slug": "update-me", "config": {}},
+        json={"type": "oidc", "name": "Old Name", "slug": "update-me", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = create.json()["id"]
@@ -110,7 +127,7 @@ async def test_delete_provider(client: AsyncClient):
     token = await _get_admin_token(client)
     create = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Delete Me", "slug": "delete-me", "config": {}},
+        json={"type": "oidc", "name": "Delete Me", "slug": "delete-me", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = create.json()["id"]
@@ -134,7 +151,7 @@ async def test_create_and_list_claim_mapping(client: AsyncClient):
     # Create provider
     prov = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Mapper", "slug": "mapper", "config": {}},
+        json={"type": "oidc", "name": "Mapper", "slug": "mapper", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = prov.json()["id"]
@@ -170,7 +187,7 @@ async def test_delete_claim_mapping(client: AsyncClient):
 
     prov = await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Del Map", "slug": "del-map", "config": {}},
+        json={"type": "oidc", "name": "Del Map", "slug": "del-map", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
     pid = prov.json()["id"]
@@ -200,168 +217,13 @@ async def test_delete_claim_mapping(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_sso_callback_creates_new_user(client: AsyncClient):
-    """SSO callback should JIT-provision a new user and return tokens."""
-    token = await _get_admin_token(client)
-
-    # Create an active provider
-    await client.post(
-        "/auth/providers",
-        json={"type": "oidc", "name": "SSO Test", "slug": "sso-test", "config": {}},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    # Simulate SSO callback
-    resp = await client.post(
-        "/auth/sso/callback",
-        json={
-            "provider_slug": "sso-test",
-            "external_id": "ext-user-123",
-            "email": "sso-user@example.com",
-            "name": "SSO User",
-            "claims": {"groups": ["engineering"]},
-        },
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "access_token" in data
-    assert "refresh_token" in data
-    assert data["user"]["email"] == "sso-user@example.com"
-    assert data["user"]["role"] == "user"  # SSO default role
-
-
-@pytest.mark.asyncio
-async def test_sso_callback_links_existing_user(client: AsyncClient):
-    """SSO callback for existing email should link accounts, not create duplicate."""
-    token = await _get_admin_token(client)
-
-    await client.post(
-        "/auth/providers",
-        json={"type": "oidc", "name": "Link Test", "slug": "link-test", "config": {}},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    # First SSO login
-    resp1 = await client.post(
-        "/auth/sso/callback",
-        json={
-            "provider_slug": "link-test",
-            "external_id": "ext-link-1",
-            "email": "link@example.com",
-            "name": "Link User",
-        },
-    )
-    user_id_1 = resp1.json()["user"]["id"]
-
-    # Second SSO login with same external_id
-    resp2 = await client.post(
-        "/auth/sso/callback",
-        json={
-            "provider_slug": "link-test",
-            "external_id": "ext-link-1",
-            "email": "link@example.com",
-            "name": "Link User",
-        },
-    )
-    user_id_2 = resp2.json()["user"]["id"]
-
-    # Same user
-    assert user_id_1 == user_id_2
-
-
-@pytest.mark.asyncio
-async def test_sso_callback_applies_claim_mappings(client: AsyncClient):
-    """SSO callback should apply claim-to-role mappings."""
-    token = await _get_admin_token(client)
-
-    prov = await client.post(
-        "/auth/providers",
-        json={"type": "oidc", "name": "Claims Test", "slug": "claims-test", "config": {}},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    pid = prov.json()["id"]
-
-    # Get reader role
-    roles = await client.get("/auth/roles", headers={"Authorization": f"Bearer {token}"})
-    reader_role = next(r for r in roles.json() if r["name"] == "reader")
-
-    # Map "department=finance" → reader role
-    await client.post(
-        f"/auth/providers/{pid}/mappings",
-        json={
-            "claim_key": "department",
-            "claim_value_pattern": "finance",
-            "role_id": reader_role["id"],
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    # SSO callback with matching claim
-    resp = await client.post(
-        "/auth/sso/callback",
-        json={
-            "provider_slug": "claims-test",
-            "external_id": "finance-user-1",
-            "email": "finance@example.com",
-            "name": "Finance User",
-            "claims": {"department": "finance"},
-        },
-    )
-    assert resp.status_code == 200
-    user_id = resp.json()["user"]["id"]
-
-    # Verify role was assigned
-    user_roles = await client.get(
-        f"/auth/users/{user_id}/roles", headers={"Authorization": f"Bearer {token}"}
-    )
-    assert user_roles.status_code == 200
-    role_names = [r["role_name"] for r in user_roles.json()]
-    assert "reader" in role_names
-
-
-@pytest.mark.asyncio
-async def test_sso_callback_inactive_provider_fails(client: AsyncClient):
-    """SSO callback should fail for inactive providers."""
-    token = await _get_admin_token(client)
-
-    prov = await client.post(
-        "/auth/providers",
-        json={
-            "type": "oidc",
-            "name": "Inactive",
-            "slug": "inactive",
-            "config": {},
-            "is_active": False,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert prov.status_code == 201
-
-    resp = await client.post(
-        "/auth/sso/callback",
-        json={
-            "provider_slug": "inactive",
-            "external_id": "ext-1",
-            "email": "x@example.com",
-            "name": "X",
-        },
-    )
-    assert resp.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_sso_callback_unknown_provider_fails(client: AsyncClient):
-    """SSO callback should fail for unknown provider slugs."""
-    resp = await client.post(
-        "/auth/sso/callback",
-        json={
-            "provider_slug": "nonexistent",
-            "external_id": "ext-1",
-            "email": "x@example.com",
-            "name": "X",
-        },
-    )
-    assert resp.status_code == 404
+# Note: the unauthenticated POST /auth/sso/callback route was removed for
+# security reasons — it minted tokens from a client-supplied email + claims
+# body, which allowed account takeover. The canonical OIDC callback path is
+# POST /auth/sso/{slug}/token (covered in tests/test_sso_security.py), which
+# exchanges the IdP code, verifies the ID-token signature, and only then
+# JIT-provisions the user. The five legacy tests for /auth/sso/callback that
+# lived here exercised the vulnerable code path and have been deleted.
 
 
 # ── Public Provider Discovery ────────────────────
@@ -383,7 +245,7 @@ async def test_public_providers_returns_only_active(client: AsyncClient):
     # Create active provider
     await client.post(
         "/auth/providers",
-        json={"type": "oidc", "name": "Active", "slug": "active-pub", "config": {}},
+        json={"type": "oidc", "name": "Active", "slug": "active-pub", "config": _oidc_config()},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -394,7 +256,7 @@ async def test_public_providers_returns_only_active(client: AsyncClient):
             "type": "oidc",
             "name": "Inactive",
             "slug": "inactive-pub",
-            "config": {},
+            "config": _oidc_config(),
             "is_active": False,
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -417,7 +279,7 @@ async def test_public_providers_minimal_fields(client: AsyncClient):
             "type": "oidc",
             "name": "Minimal",
             "slug": "minimal-pub",
-            "config": {"client_id": "secret-id", "client_secret": "super-secret"},
+            "config": _oidc_config(client_id="secret-id", client_secret="super-secret"),
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -443,11 +305,7 @@ async def test_sso_authorize_oidc(client: AsyncClient):
             "type": "oidc",
             "name": "OIDC Auth",
             "slug": "oidc-auth",
-            "config": {
-                "issuer": "https://idp.example.com",
-                "client_id": "test-client-id",
-                "client_secret": "test-secret",
-            },
+            "config": _oidc_config(client_id="test-client-id"),
         },
         headers={"Authorization": f"Bearer {token}"},
     )

@@ -24,7 +24,7 @@ def upgrade() -> None:
     op.add_column("audit_logs", sa.Column("target_type", sa.String(100), nullable=True))
     op.add_column("audit_logs", sa.Column("target_id", sa.String(255), nullable=True))
     op.add_column("audit_logs", sa.Column("tenant_id", sa.Integer, nullable=True))
-    op.add_column("audit_logs", sa.Column("details", sa.JSON, nullable=True))
+    op.add_column("audit_logs", sa.Column("details", sa.Text, nullable=True))
     op.add_column("audit_logs", sa.Column("ip_address", sa.String(45), nullable=True))
     op.add_column("audit_logs", sa.Column("user_agent", sa.String(500), nullable=True))
     op.add_column(

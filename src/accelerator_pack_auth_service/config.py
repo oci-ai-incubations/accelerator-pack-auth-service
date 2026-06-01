@@ -37,17 +37,57 @@ class Settings(BaseSettings):
     oracle_user: str = ""
     oracle_password: str = ""
 
-    # JWT
-    jwt_secret: str = "change-me-in-production"
-    jwt_algorithm: str = "HS256"
+    # JWT (RS256 only — signing keys live in the signing_keys table).
+    # issuer_url is the public origin of this auth-service (e.g.
+    # https://pack.example.com/auth); it goes into every token's `iss` claim
+    # and the OIDC discovery doc. Required when token issuance is enabled
+    # (local_auth_enabled or oidc_enabled); validated in `model_post_init`.
+    issuer_url: str = ""
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
 
     # Security
     bcrypt_rounds: int = 12
-    cors_origins: str = "*"  # comma-separated; set to specific origins in prod
+    # Comma-separated list of allowed CORS origins. Fail-closed default —
+    # operators must explicitly enumerate trusted origins (matches the
+    # pack-BE convention; AUTH_CORS_ORIGINS is plumbed from TF in
+    # ai-accelerator-starter-packs/auth-locals.tf). A wildcard is detected
+    # at middleware setup and forces allow_credentials=False to satisfy
+    # the CORS spec.
+    cors_origins: str = ""
+    # When false, emit production security headers (HSTS, etc.) and disable
+    # OpenAPI doc surfaces per security-standards.md. When true (dev),
+    # suppress HSTS so a self-signed cluster cert doesn't pin the browser
+    # into refusing the host on the next visit.
+    debug: bool = False
     rate_limit_login: str = "10/minute"
     rate_limit_register: str = "5/minute"
+    # Refresh tokens and SSO callback exchanges are the post-login
+    # equivalent of /login — protect them at the same rate.
+    rate_limit_refresh: str = "10/minute"
+    rate_limit_sso_token: str = "10/minute"
+    rate_limit_audit: str = "20/minute"
+    rate_limit_audit_export: str = "5/minute"
+    # OAuth2 token endpoint is a favored credential-stuffing target — stricter
+    # per-IP limit than other authenticated endpoints. Per-client limits
+    # belong in spec 003 / a follow-up.
+    rate_limit_oauth_token: str = "60/minute"
+
+    # OAuth2 client_credentials grant. Master switch lets ops disable the
+    # entire flow if a deployment doesn't issue service accounts.
+    client_credentials_enabled: bool = True
+    # Strict scope-grant mode (spec 003). RFC 6749 §3.3 defaults to lenient:
+    # when a request asks for a partially-allowed set, the server issues a
+    # token covering the intersection. Flipping this to true rejects the
+    # whole request with ``invalid_scope`` instead — useful for integrators
+    # who prefer loud failures over silently-narrower tokens. Default
+    # lenient because that's the RFC default and what most clients expect.
+    strict_scopes: bool = False
+    # Client tokens are typically longer-lived than user access tokens —
+    # clients re-fetch using the same credentials with no human in the loop.
+    client_token_expire_minutes: int = 60
+    # Soft cap on service accounts per owner — prevents accidental sprawl.
+    client_max_per_owner: int = 20
     account_lockout_threshold: int = 5
     account_lockout_duration_minutes: int = 30
     max_concurrent_sessions: int = 5
@@ -70,16 +110,26 @@ class Settings(BaseSettings):
     # First registered user auto-promoted to admin
     auto_admin_first_user: bool = True
 
+    # Pack-extensible RBAC: selects which PackAuthModel seeds the DB on first
+    # deploy and gates runtime require_pack_permission checks. See
+    # pack_models/registry.py for known packs. Default "base" = admin + user
+    # only (no pack-specific perms); existing paas_rag deploys MUST set
+    # AUTH_PACK=paas_rag after upgrading past this change.
+    # Field is `pack` so the env_prefix yields `AUTH_PACK`.
+    pack: str = "base"
+
     model_config = {"env_prefix": "AUTH_"}
 
     def model_post_init(self, __context):
-        """Apply profile presets if profile is not 'custom'."""
+        """Apply profile presets and validate issuer configuration."""
         if self.profile in PROFILE_PRESETS:
             preset = PROFILE_PRESETS[self.profile]
             for key, value in preset.items():
                 # Only apply preset if env var wasn't explicitly set
                 if key not in (self.model_fields_set or set()):
                     object.__setattr__(self, key, value)
+        if not self.issuer_url and (self.local_auth_enabled or self.oidc_enabled):
+            raise ValueError("AUTH_ISSUER_URL must be set when token issuance is enabled.")
 
 
 settings = Settings()

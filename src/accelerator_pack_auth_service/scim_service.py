@@ -1,6 +1,7 @@
 """SCIM 2.0 service: user/group provisioning per RFC 7644."""
 
 import hashlib
+import hmac
 from datetime import UTC, datetime
 
 from fastapi import Depends, HTTPException, status
@@ -30,7 +31,10 @@ async def require_scim_auth(
             detail="SCIM token not configured",
         )
     token_hash = hash_scim_token(credentials.credentials)
-    if token_hash != settings.scim_token:
+    # Use constant-time comparison to deny a byte-by-byte hash-recovery
+    # timing side-channel. The token is SHA-256-hashed, so once an attacker
+    # recovers the stored hash they can search-by-dictionary for the input.
+    if not hmac.compare_digest(token_hash, settings.scim_token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid SCIM token")
     return credentials.credentials
 
@@ -133,7 +137,7 @@ async def scim_create_user(db: AsyncSession, data: dict) -> User:
     user = User(
         email=email,
         name=name,
-        password_hash="!scim-provisioned",
+        password_hash="!scim-provisioned",  # noqa: S106 — sentinel that fails bcrypt.verify; SCIM-provisioned users sign in via SSO only
         role=Role.user,
         is_active=data.get("active", True),
     )

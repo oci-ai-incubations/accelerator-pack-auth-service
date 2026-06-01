@@ -205,3 +205,30 @@ async def test_security_headers(client: AsyncClient):
     resp = await client.get("/auth/health")
     assert resp.headers["x-content-type-options"] == "nosniff"
     assert resp.headers["x-frame-options"] == "DENY"
+
+
+@pytest.mark.asyncio
+async def test_hsts_emitted_when_debug_false(client: AsyncClient):
+    """Production mode (AUTH_DEBUG=false) emits HSTS so browsers pin the
+    host to HTTPS for max-age."""
+    from unittest.mock import patch
+
+    from accelerator_pack_auth_service.config import settings
+
+    with patch.object(settings, "debug", False):
+        resp = await client.get("/auth/health")
+    assert "strict-transport-security" in {k.lower() for k in resp.headers.keys()}
+
+
+@pytest.mark.asyncio
+async def test_hsts_suppressed_when_debug_true(client: AsyncClient):
+    """Demo/dev mode (AUTH_DEBUG=true) suppresses HSTS — a self-signed cert
+    behind an HSTS-pinned host renders the cluster unreachable to operators
+    until they clear chrome://net-internals/#hsts."""
+    from unittest.mock import patch
+
+    from accelerator_pack_auth_service.config import settings
+
+    with patch.object(settings, "debug", True):
+        resp = await client.get("/auth/health")
+    assert "strict-transport-security" not in {k.lower() for k in resp.headers.keys()}

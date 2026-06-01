@@ -25,6 +25,11 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 source = ["accelerator_pack_auth_service"]
+# Async route handlers dispatched via httpx ASGITransport hop through the
+# event loop; without thread+greenlet concurrency, coverage loses the lines
+# after every `await` in route bodies. Set this and the route bodies attribute
+# correctly to the test that exercised them.
+concurrency = ["thread", "greenlet"]
 
 [tool.coverage.report]
-fail_under = 65
+fail_under = 80

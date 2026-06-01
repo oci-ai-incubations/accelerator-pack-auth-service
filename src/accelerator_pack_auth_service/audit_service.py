@@ -94,13 +94,22 @@ async def query_audit_logs(
 
 
 def audit_log_to_dict(log: AuditLog) -> dict:
-    """Convert an audit log entry to a serializable dict."""
+    """Convert an audit log entry to a serializable dict.
+
+    Surfaces the raw ``actor_principal_type`` + ``actor_principal_id``
+    columns so client-driven events are attributable in the response. Spec
+    002 also asks for the resolved actor name (user email or client name)
+    — that needs a join and is deferred to a follow-up; the raw client_id
+    here is unambiguous in the meantime.
+    """
     return {
         "id": log.id,
         "timestamp": log.timestamp.isoformat() if log.timestamp else None,
         "event_type": log.event_type,
         "actor_user_id": log.actor_user_id,
         "actor_email": log.actor_email,
+        "actor_principal_type": log.actor_principal_type,
+        "actor_principal_id": log.actor_principal_id,
         "target_type": log.target_type,
         "target_id": log.target_id,
         "tenant_id": log.tenant_id,

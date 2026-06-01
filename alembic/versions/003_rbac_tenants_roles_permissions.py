@@ -23,7 +23,7 @@ def upgrade() -> None:
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("slug", sa.String(100), unique=True, nullable=False, index=True),
         sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.text("1")),
-        sa.Column("settings", sa.JSON, nullable=True),
+        sa.Column("settings", sa.Text, nullable=True),
         sa.Column("created_at", sa.DateTime, nullable=False),
     )
 

@@ -17,11 +17,13 @@ async def _get_admin_token(client: AsyncClient) -> str:
 
 @pytest.mark.asyncio
 async def test_admin_status_endpoint(client: AsyncClient):
+    from accelerator_pack_auth_service import __version__
+
     token = await _get_admin_token(client)
     resp = await client.get("/auth/admin/status", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     data = resp.json()
-    assert data["version"] == "1.0.0"
+    assert data["version"] == __version__
     assert "features" in data
     assert "stats" in data
     assert data["stats"]["total_users"] >= 1
@@ -82,10 +84,7 @@ def test_enterprise_profile_enables_all():
     assert enterprise["audit_enabled"] is True
 
 
-# ── Version ──────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_health_shows_v1(client: AsyncClient):
-    resp = await client.get("/auth/health")
-    assert resp.json()["version"] == "1.0.0"
+# NOTE: /auth/health intentionally does NOT return a version field
+# (security-standards.md "API surface": health probes leak no internal version).
+# `/auth/admin/status` returns `__version__` for operators; see
+# test_admin_status_endpoint.
