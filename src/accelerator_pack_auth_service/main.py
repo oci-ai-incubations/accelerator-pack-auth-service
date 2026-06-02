@@ -902,11 +902,28 @@ async def validate_token_for_downstream(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive"
         )
 
+    # Surface the user's explicit per-collection grants so a downstream service
+    # whose access policy keys on resource ids (e.g. OGX/llama-stack:
+    # "permit read on vector_store when the resource is in user.collections")
+    # can authorize access to collections the user neither owns nor admins.
+    # Without this the two ACL systems are siloed: auth-service knows the grant,
+    # OGX never sees it, and the collection is dropped from /v1/vector_stores.
+    # Any grant level (read/write/manage) implies at least read, so every
+    # granted collection_id is surfaced. Admins are unaffected — their downstream
+    # policy already permits everything via the "admin in roles" rule.
+    grants = await db.execute(
+        select(CollectionPermission.collection_id).where(
+            CollectionPermission.user_id == user.id
+        )
+    )
+    collections = [cid for cid in grants.scalars().all()]
+
     return {
         "principal": str(user.id),
         "attributes": {
             "roles": [claims.get("role")] if claims.get("role") else [],
             "email": [user.email],
+            "collections": collections,
         },
     }
 
