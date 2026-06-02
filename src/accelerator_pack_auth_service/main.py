@@ -823,11 +823,25 @@ async def get_me(user: User = Depends(get_current_user)):
 
 
 # ── Token validation for downstream services (e.g. llama-stack CustomAuthProvider) ──
-@app.post("/auth/validate")
+@app.post(
+    "/auth/validate",
+    summary="Validate a bearer token for a downstream service",
+    tags=["Authentication"],
+    responses={
+        200: {"description": "Token is valid; returns principal, roles, and claims"},
+        401: {"description": "Missing, expired, revoked, refresh-type, or otherwise invalid token"},
+    },
+)
 async def validate_token_for_downstream(
     payload: dict,
     db: AsyncSession = Depends(get_db),
 ):
+    """Validate a bearer token on behalf of a downstream service.
+
+    Services that delegate authentication to this service (e.g. llama-stack's
+    CustomAuthProvider) POST ``{"api_key": "<jwt>"}`` and receive the principal
+    and claims when the token is a valid, non-revoked access token.
+    """
     token = payload.get("api_key", "")
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
