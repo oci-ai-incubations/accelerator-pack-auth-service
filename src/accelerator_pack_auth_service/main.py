@@ -832,7 +832,7 @@ async def validate_token_for_downstream(
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
 
-    claims = decode_token(token)
+    claims = await decode_token(db, token)
     if claims.get("type") == "refresh":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh tokens cannot authenticate"
