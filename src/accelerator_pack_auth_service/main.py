@@ -27,6 +27,7 @@ from .auth import (
     enforce_session_limit,
     get_current_user,
     hash_password,
+    is_token_blacklisted,
     log_audit,
     record_failed_login,
     require_admin,
@@ -138,6 +139,17 @@ async def lifespan(_app: FastAPI):
     async with async_session() as session:
         await seed_roles_and_permissions(session)
         await get_active_signing_key(session)
+        # Env-seeded machine identity for downstream ETL/workers — no human
+        # registration needed. Idempotent; re-hashes a rotated secret on boot.
+        if settings.bootstrap_client_id and settings.bootstrap_client_secret:
+            from . import clients
+
+            await clients.seed_bootstrap_client(
+                session,
+                client_id=settings.bootstrap_client_id,
+                client_secret=settings.bootstrap_client_secret,
+                scopes=settings.bootstrap_client_scopes.split(),
+            )
     yield
 
 
@@ -819,6 +831,101 @@ async def revoke_token(
 )
 async def get_me(user: User = Depends(get_current_user)):
     return UserResponse.model_validate(user)
+
+
+# ── Token validation for downstream services (e.g. llama-stack CustomAuthProvider) ──
+@app.post(
+    "/auth/validate",
+    summary="Validate a bearer token for a downstream service",
+    tags=["Authentication"],
+    responses={
+        200: {"description": "Token is valid; returns principal, roles, and claims"},
+        401: {"description": "Missing, expired, revoked, refresh-type, or otherwise invalid token"},
+    },
+)
+async def validate_token_for_downstream(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Validate a bearer token on behalf of a downstream service.
+
+    Services that delegate authentication to this service (e.g. llama-stack's
+    CustomAuthProvider) POST ``{"api_key": "<jwt>"}`` and receive the principal
+    and claims when the token is a valid, non-revoked access token.
+    """
+    token = payload.get("api_key", "")
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+
+    claims = await decode_token(db, token)
+    if claims.get("type") == "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh tokens cannot authenticate"
+        )
+
+    jti = claims.get("jti")
+    if jti and await is_token_blacklisted(db, jti):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
+
+    # Service-account (client_credentials) tokens carry sub="client:<client_id>" and
+    # principal_type="client", so the int(sub) user path below does not apply. Resolve
+    # the service account and return its client principal + scopes for downstream authz.
+    if claims.get("principal_type") == PrincipalType.client.value:
+        client_id = claims.get("client_id")
+        account = await clients.get_client_by_client_id(db, client_id) if client_id else None
+        if account is None or not clients.is_client_usable(account):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Service account not found or inactive",
+            )
+        scope = claims.get("scope", "")
+        scopes = scope.split() if scope else []
+        return {
+            "principal": f"client:{client_id}",
+            "attributes": {
+                # Surface the client's granted scopes as roles as well, so
+                # downstream services whose access policy keys on `roles` (e.g.
+                # OGX/llama-stack: "user with admin in roles") can authorize a
+                # service account. A client granted the "admin" scope therefore
+                # acts as an admin downstream — used by the ETL ingestor to
+                # write the shared RAG corpus regardless of who created it.
+                "roles": scopes,
+                "scope": scopes,
+            },
+        }
+
+    user_id = int(claims["sub"])
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive"
+        )
+
+    # Surface the user's explicit per-collection grants so a downstream service
+    # whose access policy keys on resource ids (e.g. OGX/llama-stack:
+    # "permit read on vector_store when the resource is in user.collections")
+    # can authorize access to collections the user neither owns nor admins.
+    # Without this the two ACL systems are siloed: auth-service knows the grant,
+    # OGX never sees it, and the collection is dropped from /v1/vector_stores.
+    # Any grant level (read/write/manage) implies at least read, so every
+    # granted collection_id is surfaced. Admins are unaffected — their downstream
+    # policy already permits everything via the "admin in roles" rule.
+    grants = await db.execute(
+        select(CollectionPermission.collection_id).where(
+            CollectionPermission.user_id == user.id
+        )
+    )
+    collections = [cid for cid in grants.scalars().all()]
+
+    return {
+        "principal": str(user.id),
+        "attributes": {
+            "roles": [claims.get("role")] if claims.get("role") else [],
+            "email": [user.email],
+            "collections": collections,
+        },
+    }
 
 
 # ── User Management (admin only) ─────────────────

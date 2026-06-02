@@ -88,6 +88,14 @@ class Settings(BaseSettings):
     client_token_expire_minutes: int = 60
     # Soft cap on service accounts per owner — prevents accidental sprawl.
     client_max_per_owner: int = 20
+    # Env-seeded service account (machine identity for downstream ETL/workers).
+    # When both id and secret are set, the lifespan idempotently upserts a
+    # ServiceAccount with this client_id + bcrypt-hashed secret on startup, so
+    # deployments don't need a human to register/create a client first. Scopes
+    # are space-separated. Env: AUTH_BOOTSTRAP_CLIENT_ID/SECRET/SCOPES.
+    bootstrap_client_id: str = ""
+    bootstrap_client_secret: str = ""
+    bootstrap_client_scopes: str = ""
     account_lockout_threshold: int = 5
     account_lockout_duration_minutes: int = 30
     max_concurrent_sessions: int = 5

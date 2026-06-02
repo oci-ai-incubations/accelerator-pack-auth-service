@@ -134,6 +134,45 @@ async def create_client(
     return account, plaintext_secret
 
 
+async def seed_bootstrap_client(
+    db: AsyncSession,
+    *,
+    client_id: str,
+    client_secret: str,
+    scopes: list[str],
+) -> ServiceAccount:
+    """Idempotently upsert an env-seeded (ownerless) service account on startup.
+
+    Unlike ``create_client`` (admin API), the id + secret are supplied by the
+    deployment (env), there is no human owner, and the operation is safe to run
+    on every boot:
+      - if the client_id does not exist, insert it (bcrypt-hashing the secret);
+      - if it exists, re-hash the secret + refresh scopes so a rotated env
+        secret takes effect, and re-activate it if it had been revoked.
+    """
+    account = await get_client_by_client_id(db, client_id)
+    if account is None:
+        account = ServiceAccount(
+            client_id=client_id,
+            client_secret_hash=hash_secret(client_secret),
+            name="bootstrap-service-account",
+            description="Env-seeded machine identity (AUTH_BOOTSTRAP_CLIENT_*).",
+            scopes=serialize_scopes(scopes),
+            owner_user_id=None,
+            is_active=True,
+            created_at=datetime.now(UTC),
+        )
+        db.add(account)
+    else:
+        account.client_secret_hash = hash_secret(client_secret)
+        account.scopes = serialize_scopes(scopes)
+        account.is_active = True
+        account.revoked_at = None
+    await db.commit()
+    await db.refresh(account)
+    return account
+
+
 async def get_client_by_client_id(db: AsyncSession, client_id: str) -> ServiceAccount | None:
     """Look up a service account by its public client_id."""
     result = await db.execute(select(ServiceAccount).where(ServiceAccount.client_id == client_id))

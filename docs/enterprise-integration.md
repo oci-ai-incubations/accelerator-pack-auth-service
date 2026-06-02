@@ -192,6 +192,100 @@ curl -X POST https://auth.example.com/auth/providers \
   }'
 ```
 
+### OCI Identity Domains
+
+Oracle Cloud Infrastructure Identity Domains natively supports OIDC and can serve as the identity provider for the auth service. This is the recommended setup for OCI-deployed accelerator packs.
+
+**Step 1: Create an OIDC Confidential Application**
+
+1. In the OCI Console, go to **Identity & Security > Domains**.
+2. Select your domain (e.g., "Default").
+3. Click **Applications > Add application > Confidential Application**.
+4. Under **Configure OAuth**:
+   - Check **Authorization Code** as the allowed grant type.
+   - Set **Redirect URL** to your frontend callback (e.g., `https://app.example.com/auth/callback`).
+   - Set **Post-logout redirect URL** to `https://app.example.com/login`.
+   - Set **Client type** to Confidential.
+5. Under **Token issuance policy**, add scopes: `openid`, `email`, `profile`.
+6. Click **Create**, then **Activate** the application.
+7. Copy the **Client ID** and **Client Secret** from the application details.
+8. Find your **Domain URL** under Domain settings (format: `https://idcs-<guid>.identity.oraclecloud.com`).
+
+**Step 2: Register the Provider**
+
+```bash
+curl -X POST https://auth.example.com/auth/providers \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "oidc",
+    "name": "OCI Identity",
+    "slug": "oci-identity",
+    "config": {
+      "issuer": "https://idcs-<guid>.identity.oraclecloud.com",
+      "client_id": "<your-client-id>",
+      "client_secret": "<your-client-secret>",
+      "scope": "openid email profile",
+      "authorize_url": "https://idcs-<guid>.identity.oraclecloud.com/oauth2/v1/authorize",
+      "token_url": "https://idcs-<guid>.identity.oraclecloud.com/oauth2/v1/token",
+      "userinfo_url": "https://idcs-<guid>.identity.oraclecloud.com/oauth2/v1/userinfo"
+    },
+    "is_active": true,
+    "priority": 10
+  }'
+```
+
+You can also configure this via the **Identity Providers** tab in the admin Settings UI — click "Add Provider" and paste the config JSON above.
+
+**Step 3: Configure Claim Mappings (Optional)**
+
+OCI Identity Domains returns standard OIDC claims. Map OCI groups to internal roles:
+
+```bash
+# Map the "Administrators" OCI group to the admin role
+curl -X POST https://auth.example.com/auth/providers/<provider_id>/mappings \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "claim_key": "groups",
+    "claim_value_pattern": "Administrators",
+    "role_id": <admin_role_id>,
+    "priority": 10,
+    "is_regex": false
+  }'
+
+# Map all users in groups starting with "OracleAI_" to the user role
+curl -X POST https://auth.example.com/auth/providers/<provider_id>/mappings \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "claim_key": "groups",
+    "claim_value_pattern": "OracleAI_.*",
+    "role_id": <user_role_id>,
+    "priority": 5,
+    "is_regex": true
+  }'
+```
+
+**Step 4: Test the SSO Flow**
+
+1. Go to the login page — the "OCI Identity" button should appear.
+2. Click it — you'll be redirected to the OCI Identity Domain login page.
+3. Authenticate with your OCI credentials.
+4. OCI redirects back to `/auth/callback` with an authorization code.
+5. The auth service exchanges the code, JIT provisions your user, applies claim mappings, and issues internal tokens.
+6. You're logged in.
+
+**OCI Identity Domain OIDC Endpoints Reference:**
+
+| Endpoint | URL |
+|----------|-----|
+| Authorization | `https://idcs-<guid>.identity.oraclecloud.com/oauth2/v1/authorize` |
+| Token | `https://idcs-<guid>.identity.oraclecloud.com/oauth2/v1/token` |
+| UserInfo | `https://idcs-<guid>.identity.oraclecloud.com/oauth2/v1/userinfo` |
+| JWKS | `https://idcs-<guid>.identity.oraclecloud.com/admin/v1/SigningCert/jwk` |
+| Discovery | `https://idcs-<guid>.identity.oraclecloud.com/.well-known/openid-configuration` |
+
 ## SAML Setup
 
 ### Okta SAML
