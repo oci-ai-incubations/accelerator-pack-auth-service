@@ -462,7 +462,9 @@ class ServiceAccount(Base):
     description = Column(Text, nullable=True)
     # JSON-encoded list of scope codenames. Empty string = no scopes granted.
     scopes = Column(Text, nullable=False, default="")
-    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    # Nullable: env-seeded (bootstrap) service accounts have no human owner.
+    # Admin-API-created accounts still set this to the creating admin's id.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))

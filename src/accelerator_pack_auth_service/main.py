@@ -139,6 +139,17 @@ async def lifespan(_app: FastAPI):
     async with async_session() as session:
         await seed_roles_and_permissions(session)
         await get_active_signing_key(session)
+        # Env-seeded machine identity for downstream ETL/workers — no human
+        # registration needed. Idempotent; re-hashes a rotated secret on boot.
+        if settings.bootstrap_client_id and settings.bootstrap_client_secret:
+            from . import clients
+
+            await clients.seed_bootstrap_client(
+                session,
+                client_id=settings.bootstrap_client_id,
+                client_secret=settings.bootstrap_client_secret,
+                scopes=settings.bootstrap_client_scopes.split(),
+            )
     yield
 
 
@@ -855,6 +866,26 @@ async def validate_token_for_downstream(
     jti = claims.get("jti")
     if jti and await is_token_blacklisted(db, jti):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
+
+    # Service-account (client_credentials) tokens carry sub="client:<client_id>" and
+    # principal_type="client", so the int(sub) user path below does not apply. Resolve
+    # the service account and return its client principal + scopes for downstream authz.
+    if claims.get("principal_type") == PrincipalType.client.value:
+        client_id = claims.get("client_id")
+        account = await clients.get_client_by_client_id(db, client_id) if client_id else None
+        if account is None or not clients.is_client_usable(account):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Service account not found or inactive",
+            )
+        scope = claims.get("scope", "")
+        return {
+            "principal": f"client:{client_id}",
+            "attributes": {
+                "roles": [],
+                "scope": scope.split() if scope else [],
+            },
+        }
 
     user_id = int(claims["sub"])
     result = await db.execute(select(User).where(User.id == user_id))

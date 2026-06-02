@@ -331,7 +331,8 @@ class ServiceAccountResponse(BaseModel):
     name: str
     description: str | None
     scopes: list[str]
-    owner_user_id: int
+    # Nullable: env-seeded (bootstrap) service accounts have no human owner.
+    owner_user_id: int | None
     is_active: bool
     expires_at: datetime | None
     created_at: datetime
