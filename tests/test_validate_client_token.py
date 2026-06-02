@@ -55,6 +55,9 @@ async def test_validate_accepts_client_credentials_token(client: AsyncClient):
     body = resp.json()
     assert body["principal"] == f"client:{sa['client_id']}"
     assert "scope" in body["attributes"]
+    # Scopes are surfaced as roles too, so downstream role-based policy can
+    # authorize the service account (e.g. an "admin"-scoped client -> admin role).
+    assert body["attributes"]["roles"] == body["attributes"]["scope"]
 
 
 @pytest.mark.asyncio

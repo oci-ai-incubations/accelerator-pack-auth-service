@@ -879,11 +879,18 @@ async def validate_token_for_downstream(
                 detail="Service account not found or inactive",
             )
         scope = claims.get("scope", "")
+        scopes = scope.split() if scope else []
         return {
             "principal": f"client:{client_id}",
             "attributes": {
-                "roles": [],
-                "scope": scope.split() if scope else [],
+                # Surface the client's granted scopes as roles as well, so
+                # downstream services whose access policy keys on `roles` (e.g.
+                # OGX/llama-stack: "user with admin in roles") can authorize a
+                # service account. A client granted the "admin" scope therefore
+                # acts as an admin downstream — used by the ETL ingestor to
+                # write the shared RAG corpus regardless of who created it.
+                "roles": scopes,
+                "scope": scopes,
             },
         }
 
