@@ -87,3 +87,7 @@ def downgrade() -> None:
     op.drop_table("claim_role_mappings")
     op.drop_table("external_identities")
     op.drop_table("identity_providers")
+    # Postgres keeps enum types after their table is dropped; remove explicitly
+    # so a re-upgrade's CREATE TYPE doesn't collide. No-op on SQLite/Oracle.
+    if op.get_bind().dialect.name == "postgresql":
+        sa.Enum(name="providertype").drop(op.get_bind(), checkfirst=True)

@@ -82,3 +82,8 @@ def downgrade() -> None:
     op.drop_index("ix_collection_perm_user_col", table_name="collection_permissions")
     op.drop_table("collection_permissions")
     op.drop_table("users")
+    # Postgres keeps enum types after their table is dropped; remove explicitly
+    # so a re-upgrade's CREATE TYPE doesn't collide. No-op on SQLite/Oracle.
+    if op.get_bind().dialect.name == "postgresql":
+        sa.Enum(name="permissionlevel").drop(op.get_bind(), checkfirst=True)
+        sa.Enum(name="role").drop(op.get_bind(), checkfirst=True)

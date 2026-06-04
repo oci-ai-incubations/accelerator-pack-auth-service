@@ -27,11 +27,18 @@ def upgrade() -> None:
     op.add_column("audit_logs", sa.Column("details", sa.Text, nullable=True))
     op.add_column("audit_logs", sa.Column("ip_address", sa.String(45), nullable=True))
     op.add_column("audit_logs", sa.Column("user_agent", sa.String(500), nullable=True))
+    # On Postgres an ENUM type must exist before a column can reference it.
+    # `create_table` auto-emits CREATE TYPE for inline enums, but `add_column`
+    # does not — so create it explicitly here. No-op on SQLite/Oracle (no native
+    # enum types; the column renders as VARCHAR). checkfirst guards re-runs.
+    audit_result = sa.Enum("success", "failure", name="auditresult")
+    if op.get_bind().dialect.name == "postgresql":
+        audit_result.create(op.get_bind(), checkfirst=True)
     op.add_column(
         "audit_logs",
         sa.Column(
             "result",
-            sa.Enum("success", "failure", name="auditresult"),
+            audit_result,
             nullable=True,
             server_default="success",
         ),
@@ -54,3 +61,7 @@ def downgrade() -> None:
     op.drop_column("audit_logs", "actor_user_id")
     op.drop_column("audit_logs", "event_type")
     op.drop_column("audit_logs", "timestamp")
+    # Drop the enum type after the column that referenced it is gone (Postgres
+    # keeps the type around otherwise; mirrors migration 007's downgrade).
+    if op.get_bind().dialect.name == "postgresql":
+        sa.Enum(name="auditresult").drop(op.get_bind(), checkfirst=True)
