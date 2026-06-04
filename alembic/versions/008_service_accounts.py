@@ -37,10 +37,10 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.true()),
-        sa.Column("expires_at", sa.DateTime, nullable=True),
-        sa.Column("created_at", sa.DateTime, nullable=False),
-        sa.Column("revoked_at", sa.DateTime, nullable=True),
-        sa.Column("last_used_at", sa.DateTime, nullable=True),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_used_ip", sa.String(45), nullable=True),
     )
     op.create_index("ix_service_accounts_client_id", "service_accounts", ["client_id"], unique=True)

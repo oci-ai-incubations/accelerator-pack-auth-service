@@ -32,8 +32,8 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("redirect_uri", sa.String(2048), nullable=False),
-        sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.Column("expires_at", sa.DateTime(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index("ix_sso_state_expires_at", "sso_state", ["expires_at"])
 

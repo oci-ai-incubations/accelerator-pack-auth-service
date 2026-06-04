@@ -21,8 +21,8 @@ def upgrade() -> None:
         "token_blacklist",
         sa.Column("id", sa.Integer, sa.Identity(always=True), primary_key=True),
         sa.Column("jti", sa.String(36), nullable=False, unique=True, index=True),
-        sa.Column("expires_at", sa.DateTime, nullable=False),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
 
     op.create_table(
@@ -30,7 +30,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer, sa.Identity(always=True), primary_key=True),
         sa.Column("email", sa.String(320), nullable=False, index=True),
         sa.Column("ip_address", sa.String(45), nullable=True),
-        sa.Column("attempted_at", sa.DateTime, nullable=False),
+        sa.Column("attempted_at", sa.DateTime(timezone=True), nullable=False),
     )
 
 

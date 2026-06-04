@@ -36,7 +36,7 @@ def upgrade() -> None:
         sa.Column("config", sa.Text, nullable=False),
         sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.true()),
         sa.Column("priority", sa.Integer, nullable=False, server_default=sa.text("0")),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
 
     op.create_table(
@@ -57,7 +57,7 @@ def upgrade() -> None:
         sa.Column("external_id", sa.String(255), nullable=False),
         sa.Column("email", sa.String(320), nullable=True),
         sa.Column("raw_claims", sa.Text, nullable=True),
-        sa.Column("last_login_at", sa.DateTime, nullable=True),
+        sa.Column("last_login_at", sa.DateTime(timezone=True), nullable=True),
         sa.UniqueConstraint("provider_id", "external_id", name="uq_provider_external_id"),
     )
 

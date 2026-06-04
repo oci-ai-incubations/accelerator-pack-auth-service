@@ -116,7 +116,7 @@ async def seed_roles_and_permissions(
     # Seed roles
     for role_name in pack_model.roles:
         existing = await db.execute(
-            select(DbRole).where(DbRole.name == role_name, DbRole.is_system == 1)
+            select(DbRole).where(DbRole.name == role_name, DbRole.is_system.is_(True))
         )
         role = existing.scalar_one_or_none()
         if not role:
@@ -191,7 +191,7 @@ async def check_permission(
         .join(DbRole, DbRole.id == RolePermission.role_id)
         .where(
             DbRole.name == user.role.value,
-            DbRole.is_system == 1,
+            DbRole.is_system.is_(True),
             Permission.codename == permission_codename,
         )
     )

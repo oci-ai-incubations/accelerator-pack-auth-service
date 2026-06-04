@@ -24,7 +24,7 @@ def upgrade() -> None:
         sa.Column("slug", sa.String(100), unique=True, nullable=False, index=True),
         sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.true()),
         sa.Column("settings", sa.Text, nullable=True),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
 
     op.create_table(
@@ -37,7 +37,7 @@ def upgrade() -> None:
         sa.Column("description", sa.String(500), nullable=True),
         sa.Column("is_system", sa.Boolean, nullable=False, server_default=sa.false()),
         sa.Column("is_default", sa.Boolean, nullable=False, server_default=sa.false()),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.UniqueConstraint("tenant_id", "name", name="uq_role_tenant_name"),
     )
 
@@ -80,7 +80,7 @@ def upgrade() -> None:
         sa.Column("scope_type", sa.String(50), nullable=True),
         sa.Column("scope_id", sa.String(255), nullable=True),
         sa.Column("granted_by", sa.Integer, sa.ForeignKey("users.id"), nullable=True),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index("ix_user_role_user_id", "user_roles", ["user_id"])
     op.create_index("ix_user_role_role_id", "user_roles", ["role_id"])
@@ -106,7 +106,7 @@ def upgrade() -> None:
             nullable=True,
         ),
         sa.Column("granted_by", sa.Integer, sa.ForeignKey("users.id"), nullable=True),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index("ix_direct_grant_user_id", "direct_grants", ["user_id"])
 

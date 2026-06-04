@@ -35,9 +35,9 @@ def upgrade() -> None:
             nullable=False,
             server_default="active",
         ),
-        sa.Column("created_at", sa.DateTime, nullable=False),
-        sa.Column("rotated_at", sa.DateTime, nullable=True),
-        sa.Column("revoked_at", sa.DateTime, nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("rotated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
     )
     op.create_index("ix_signing_keys_kid", "signing_keys", ["kid"], unique=True)
     op.create_index("ix_signing_keys_status", "signing_keys", ["status"])

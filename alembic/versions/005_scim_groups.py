@@ -36,8 +36,8 @@ def upgrade() -> None:
             nullable=False,
             server_default="local",
         ),
-        sa.Column("created_at", sa.DateTime, nullable=False),
-        sa.Column("updated_at", sa.DateTime, nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
     )
 
     op.create_table(
