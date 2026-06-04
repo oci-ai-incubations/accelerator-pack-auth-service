@@ -34,7 +34,7 @@ def upgrade() -> None:
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("slug", sa.String(100), unique=True, nullable=False, index=True),
         sa.Column("config", sa.Text, nullable=False),
-        sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.text("1")),
+        sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.true()),
         sa.Column("priority", sa.Integer, nullable=False, server_default=sa.text("0")),
         sa.Column("created_at", sa.DateTime, nullable=False),
     )
@@ -79,7 +79,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("priority", sa.Integer, nullable=False, server_default=sa.text("0")),
-        sa.Column("is_regex", sa.Boolean, nullable=False, server_default=sa.text("0")),
+        sa.Column("is_regex", sa.Boolean, nullable=False, server_default=sa.false()),
     )
 
 

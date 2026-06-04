@@ -28,7 +28,7 @@ def upgrade() -> None:
             sa.Enum("admin", "user", "reader", "pending", name="role"),
             nullable=False,
         ),
-        sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.text("1")),
+        sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.true()),
         sa.Column("created_at", sa.DateTime, nullable=False),
     )
 
@@ -61,7 +61,7 @@ def upgrade() -> None:
         ),
         sa.Column("token_hash", sa.String(255), nullable=False, unique=True, index=True),
         sa.Column("expires_at", sa.DateTime, nullable=False),
-        sa.Column("revoked", sa.Boolean, nullable=False, server_default=sa.text("0")),
+        sa.Column("revoked", sa.Boolean, nullable=False, server_default=sa.false()),
         sa.Column("created_at", sa.DateTime, nullable=False),
     )
 
