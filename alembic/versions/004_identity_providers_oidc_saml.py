@@ -34,9 +34,9 @@ def upgrade() -> None:
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("slug", sa.String(100), unique=True, nullable=False, index=True),
         sa.Column("config", sa.Text, nullable=False),
-        sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.text("1")),
+        sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.true()),
         sa.Column("priority", sa.Integer, nullable=False, server_default=sa.text("0")),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
 
     op.create_table(
@@ -57,7 +57,7 @@ def upgrade() -> None:
         sa.Column("external_id", sa.String(255), nullable=False),
         sa.Column("email", sa.String(320), nullable=True),
         sa.Column("raw_claims", sa.Text, nullable=True),
-        sa.Column("last_login_at", sa.DateTime, nullable=True),
+        sa.Column("last_login_at", sa.DateTime(timezone=True), nullable=True),
         sa.UniqueConstraint("provider_id", "external_id", name="uq_provider_external_id"),
     )
 
@@ -79,7 +79,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("priority", sa.Integer, nullable=False, server_default=sa.text("0")),
-        sa.Column("is_regex", sa.Boolean, nullable=False, server_default=sa.text("0")),
+        sa.Column("is_regex", sa.Boolean, nullable=False, server_default=sa.false()),
     )
 
 
@@ -87,3 +87,7 @@ def downgrade() -> None:
     op.drop_table("claim_role_mappings")
     op.drop_table("external_identities")
     op.drop_table("identity_providers")
+    # Postgres keeps enum types after their table is dropped; remove explicitly
+    # so a re-upgrade's CREATE TYPE doesn't collide. No-op on SQLite/Oracle.
+    if op.get_bind().dialect.name == "postgresql":
+        sa.Enum(name="providertype").drop(op.get_bind(), checkfirst=True)

@@ -28,8 +28,8 @@ def upgrade() -> None:
             sa.Enum("admin", "user", "reader", "pending", name="role"),
             nullable=False,
         ),
-        sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.text("1")),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.true()),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
 
     op.create_table(
@@ -44,7 +44,7 @@ def upgrade() -> None:
             sa.Enum("read", "write", "manage", name="permissionlevel"),
             nullable=False,
         ),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index(
         "ix_collection_perm_user_col",
@@ -60,9 +60,9 @@ def upgrade() -> None:
             "user_id", sa.Integer, sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False
         ),
         sa.Column("token_hash", sa.String(255), nullable=False, unique=True, index=True),
-        sa.Column("expires_at", sa.DateTime, nullable=False),
-        sa.Column("revoked", sa.Boolean, nullable=False, server_default=sa.text("0")),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("revoked", sa.Boolean, nullable=False, server_default=sa.false()),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
 
     op.create_table(
@@ -72,7 +72,7 @@ def upgrade() -> None:
         sa.Column("action", sa.String(100), nullable=False),
         sa.Column("target", sa.String(255), nullable=True),
         sa.Column("detail", sa.Text, nullable=True),
-        sa.Column("created_at", sa.DateTime, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
 
 
@@ -82,3 +82,8 @@ def downgrade() -> None:
     op.drop_index("ix_collection_perm_user_col", table_name="collection_permissions")
     op.drop_table("collection_permissions")
     op.drop_table("users")
+    # Postgres keeps enum types after their table is dropped; remove explicitly
+    # so a re-upgrade's CREATE TYPE doesn't collide. No-op on SQLite/Oracle.
+    if op.get_bind().dialect.name == "postgresql":
+        sa.Enum(name="permissionlevel").drop(op.get_bind(), checkfirst=True)
+        sa.Enum(name="role").drop(op.get_bind(), checkfirst=True)

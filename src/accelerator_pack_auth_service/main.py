@@ -1852,7 +1852,7 @@ async def list_public_providers(db: AsyncSession = Depends(get_db)):
     """Public endpoint: returns active SSO providers for the login page."""
     result = await db.execute(
         select(IdentityProvider)
-        .where(IdentityProvider.is_active == 1)
+        .where(IdentityProvider.is_active.is_(True))
         .order_by(IdentityProvider.priority.desc())
     )
     return [
@@ -1894,7 +1894,7 @@ async def sso_authorize(
 
     result = await db.execute(
         select(IdentityProvider).where(
-            IdentityProvider.slug == slug, IdentityProvider.is_active == 1
+            IdentityProvider.slug == slug, IdentityProvider.is_active.is_(True)
         )
     )
     provider = result.scalar_one_or_none()
@@ -2007,7 +2007,7 @@ async def sso_token_exchange(
 
     result = await db.execute(
         select(IdentityProvider).where(
-            IdentityProvider.slug == slug, IdentityProvider.is_active == 1
+            IdentityProvider.slug == slug, IdentityProvider.is_active.is_(True)
         )
     )
     provider = result.scalar_one_or_none()
@@ -2703,10 +2703,10 @@ async def admin_status(
 
     user_count = await db.scalar(select(func.count()).select_from(User))
     active_users = await db.scalar(
-        select(func.count()).select_from(User).where(User.is_active == 1)
+        select(func.count()).select_from(User).where(User.is_active.is_(True))
     )
     active_sessions = await db.scalar(
-        select(func.count()).select_from(RefreshToken).where(RefreshToken.revoked == 0)
+        select(func.count()).select_from(RefreshToken).where(RefreshToken.revoked.is_(False))
     )
     provider_count = await db.scalar(select(func.count()).select_from(IdentityProvider))
     group_count = await db.scalar(select(func.count()).select_from(Group))

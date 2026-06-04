@@ -75,7 +75,7 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(Enum(Role), nullable=False, default=Role.pending)
     is_active = Column(Boolean, nullable=False, default=True)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
     # JSON-encoded list of scope codenames. NULL means "use the role's full
     # permission set" — the common case. Non-NULL pins this user to a narrower
     # default scope set (rare; e.g. a power user who wants to limit their own
@@ -97,7 +97,7 @@ class CollectionPermission(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     collection_id = Column(String(255), nullable=False)
     permission_level = Column(Enum(PermissionLevel), nullable=False, default=PermissionLevel.read)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
     user = relationship("User", back_populates="collection_permissions")
 
@@ -112,9 +112,9 @@ class RefreshToken(Base):
     id = Column(Integer, Identity(always=True), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     token_hash = Column(String(255), nullable=False, unique=True, index=True)
-    expires_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked = Column(Boolean, nullable=False, default=False)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
     user = relationship("User", back_populates="refresh_tokens")
 
@@ -124,8 +124,8 @@ class TokenBlacklist(Base):
 
     id = Column(Integer, Identity(always=True), primary_key=True)
     jti = Column(String(36), nullable=False, unique=True, index=True)
-    expires_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
 
 class FailedLoginAttempt(Base):
@@ -134,7 +134,9 @@ class FailedLoginAttempt(Base):
     id = Column(Integer, Identity(always=True), primary_key=True)
     email = Column(String(320), nullable=False, index=True)
     ip_address = Column(String(45), nullable=True)
-    attempted_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    attempted_at = Column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
 
 
 # ── Phase 2: Fine-Grained Authorization ──────────
@@ -148,7 +150,7 @@ class Tenant(Base):
     slug = Column(String(100), unique=True, nullable=False, index=True)
     is_active = Column(Boolean, nullable=False, default=True)
     settings = Column(JSONText, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
 
 class DbRole(Base):
@@ -160,7 +162,7 @@ class DbRole(Base):
     description = Column(String(500), nullable=True)
     is_system = Column(Boolean, nullable=False, default=False)
     is_default = Column(Boolean, nullable=False, default=False)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
     permissions = relationship(
         "RolePermission", back_populates="role", cascade="all, delete-orphan"
@@ -200,7 +202,7 @@ class UserRole(Base):
     scope_type = Column(String(50), nullable=True)
     scope_id = Column(String(255), nullable=True)
     granted_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
     user = relationship("User", foreign_keys=[user_id])
     role = relationship("DbRole")
@@ -223,7 +225,7 @@ class DirectGrant(Base):
     resource_id = Column(String(255), nullable=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
     granted_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
     user = relationship("User", foreign_keys=[user_id])
     permission = relationship("Permission")
@@ -268,7 +270,7 @@ class IdentityProvider(Base):
     config = Column(JSONText, nullable=False, default=dict)
     is_active = Column(Boolean, nullable=False, default=True)
     priority = Column(Integer, nullable=False, default=0)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
     claim_mappings = relationship(
         "ClaimRoleMapping", back_populates="provider", cascade="all, delete-orphan"
@@ -286,7 +288,7 @@ class ExternalIdentity(Base):
     external_id = Column(String(255), nullable=False)
     email = Column(String(320), nullable=True)
     raw_claims = Column(JSONText, nullable=True)
-    last_login_at = Column(DateTime, nullable=True)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User")
     provider = relationship("IdentityProvider")
@@ -332,8 +334,8 @@ class Group(Base):
     description = Column(String(500), nullable=True)
     external_id = Column(String(255), nullable=True)
     source = Column(Enum(GroupSource), nullable=False, default=GroupSource.local)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-    updated_at = Column(DateTime, nullable=True, onupdate=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
+    updated_at = Column(DateTime(timezone=True), nullable=True, onupdate=lambda: datetime.now(UTC))
 
     memberships = relationship(
         "GroupMembership", back_populates="group", cascade="all, delete-orphan"
@@ -381,8 +383,8 @@ class SsoState(Base):
         Integer, ForeignKey("identity_providers.id", ondelete="CASCADE"), nullable=False
     )
     redirect_uri = Column(String(2048), nullable=False)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-    expires_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
 
 
 class SigningKeyStatus(enum.StrEnum):
@@ -405,9 +407,9 @@ class SigningKey(Base):
         default=SigningKeyStatus.active,
         index=True,
     )
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-    rotated_at = Column(DateTime, nullable=True)
-    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
+    rotated_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class AuditResult(enum.StrEnum):
@@ -419,7 +421,9 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id = Column(Integer, Identity(always=True), primary_key=True)
-    timestamp = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC), index=True)
+    timestamp = Column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC), index=True
+    )
     event_type = Column(String(100), nullable=False, index=True)
     actor_user_id = Column(Integer, nullable=True)
     actor_email = Column(String(320), nullable=True)
@@ -440,7 +444,7 @@ class AuditLog(Base):
     action = Column(String(100), nullable=True)
     target = Column(String(255), nullable=True)
     detail = Column(Text, nullable=True)
-    created_at = Column(DateTime, nullable=True, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime(timezone=True), nullable=True, default=lambda: datetime.now(UTC))
 
 
 class ServiceAccount(Base):
@@ -464,8 +468,8 @@ class ServiceAccount(Base):
     scopes = Column(Text, nullable=False, default="")
     owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
-    expires_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-    revoked_at = Column(DateTime, nullable=True)
-    last_used_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
     last_used_ip = Column(String(45), nullable=True)
